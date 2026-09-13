@@ -18,8 +18,7 @@ import (
 const flagGithubRepo = "github-repo"
 
 // CurationActionsCommand curates the GitHub Actions that actually resolved on this job's
-// runner, using the runner's own action cache as the source of truth (not the workflow YAML
-// alone - see githubactions.DiscoverActionCache).
+// runner, taking the runner's action cache as the source of truth rather than the workflow YAML.
 type CurationActionsCommand struct {
 	workingDir      string
 	actionsCacheDir string
@@ -93,23 +92,20 @@ func (c *CurationActionsCommand) CommandName() string {
 
 // Run discovers the actions resolved on this job's runner, decides a curation outcome per
 // action, prints and records the report, and returns an error if any action was Rejected. The
-// delivery action (jfrog/setup-jfrog-cli) itself is always excluded.
+// delivery action (jfrog/setup-jfrog-cli) is always excluded.
 //
 // If any action cannot be decided at all, Run returns that error and produces no report and no
 // job summary - a partial one would omit exactly the actions whose status is unknown.
 //
-// It runs in one of two modes, depending on whether the workflow YAML is available:
-//
-//   - ATTRIBUTED - a workflow file was identified. Its "uses:" lines
-//     supply the direct references, so entries are cross-referenced for Parent and Subpath
-//     metadata and narrowed to this workflow's dependency graph. The report carries a Parent
-//     column.
-//   - STRUCTURE-ONLY - no workflow file. The runner's action cache is taken as-is: every
-//     discovered entry is curated, with no Parent or Subpath metadata and no Parent column.
+// With a workflow file it runs ATTRIBUTED, cross-referencing entries for Parent and Subpath
+// metadata and rendering a Parent column; without one, STRUCTURE-ONLY. The two differ in report
+// detail only, never in coverage - every entry the runner resolved is curated either way.
 func (c *CurationActionsCommand) Run() (err error) {
-	// A one-shot CLI invocation, so this is the root of the call tree. No deadline is imposed
-	// here: how long to wait on the decision service, and whether a timeout should fail the job
-	// or let it through, are curation-system policy rather than this command's to decide.
+	// A one-shot CLI invocation, so this is the root of the call tree, and no deadline is imposed
+	// here. Artifactory carries a fail-open / fail-close setting that governs what happens when
+	// curation cannot reach a verdict - a timeout, or a decision service that is unreachable.
+	// Fetching that setting and honouring it lands with the real decision client; until then this
+	// command is unconditionally fail-closed.
 	ctx := context.Background()
 
 	workingDir := c.workingDir
@@ -135,17 +131,16 @@ func (c *CurationActionsCommand) Run() (err error) {
 		return nil
 	}
 
-	used, target, attributed, err := c.parseWorkflowUses(workingDir)
+	used, attributed, err := c.parseWorkflowUses(workingDir)
 	if err != nil {
 		return err
 	}
 	if attributed {
 		discovered = githubactions.CrossReference(discovered, used)
-		discovered = githubactions.FilterRelevant(discovered, used)
 	}
 	discovered = githubactions.ExcludeDeliveryAction(discovered)
 	if len(discovered) == 0 {
-		log.Info("No GitHub Actions relevant to this workflow found in the runner's action cache - nothing to curate.")
+		log.Info("The runner's action cache holds only the action delivering this check - nothing to curate.")
 		return nil
 	}
 
@@ -171,7 +166,7 @@ func (c *CurationActionsCommand) Run() (err error) {
 
 	log.Info(fmt.Sprintf("GitHub Actions Curation Report:\n%s", githubactions.RenderMarkdownTable(rows, attributed)))
 
-	if recordErr := c.recordSummary(rows, target, attributed); recordErr != nil {
+	if recordErr := c.recordSummary(rows, attributed); recordErr != nil {
 		log.Warn(fmt.Sprintf("failed to record GitHub Actions curation summary: %v", recordErr))
 	}
 
@@ -182,21 +177,14 @@ func (c *CurationActionsCommand) Run() (err error) {
 }
 
 // parseWorkflowUses resolves which workflow file to attribute against, returning its uses:
-// refs, a target label for the report, and whether attribution is possible at all.
+// refs and whether attribution is possible at all. Resolution order:
 //
-// attributed is false when no workflow file could be identified, or when a file named by the
-// environment turns out not to exist. Run then curates the action cache structure alone - see
-// its doc comment for why that is sound rather than degraded.
-//
-// Resolution order:
-//
-//  1. --workflow-file (+ --workflow-job) - explicit. Unreadable is an error: the caller
+//  1. --workflow-file (+ --workflow-job) - explicit, so unreadable is an error: the caller
 //     asserted the file exists.
 //  2. GITHUB_WORKFLOW_REF (+ GITHUB_JOB) - the running workflow and job on a runner. Absent
-//     from disk falls back to file system
-//  3. neither - fall back to file system.
-func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used []githubactions.WorkflowUse, target string,
-	attributed bool, err error) {
+//     from disk falls back to structure-only.
+//  3. neither - structure-only.
+func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used []githubactions.WorkflowUse, attributed bool, err error) {
 	jobID := c.jobID
 	if jobID == "" {
 		jobID = githubactions.DefaultJobID()
@@ -209,7 +197,7 @@ func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used []gi
 	}
 	if workflowFile == "" {
 		log.Info("No workflow file was identified - curating the runner's action cache as-is, without parent attribution.")
-		return nil, c.actionsCacheDir, false, nil
+		return nil, false, nil
 	}
 	// GITHUB_WORKFLOW_REF yields a repo-relative path, and --workflow-file is documented as one
 	// (".github/workflows/ci.yml"), so both resolve against the working directory.
@@ -218,24 +206,24 @@ func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used []gi
 	}
 	used, err = githubactions.ParseWorkflowUses(workflowFile, jobID)
 	if err == nil {
-		return used, workflowFile, true, nil
+		return used, true, nil
 	}
 	if errors.Is(err, githubactions.ErrJobUnknown) {
 		log.Info(fmt.Sprintf("Cannot identify job %q in workflow file %q - curating the runner's action cache as-is, without parent attribution.", jobID, workflowFile))
-		return nil, c.actionsCacheDir, false, nil
+		return nil, false, nil
 	}
 	if explicit || !errors.Is(err, os.ErrNotExist) {
-		return nil, workflowFile, false, err
+		return nil, false, err
 	}
 	log.Warn(fmt.Sprintf("Workflow file %q (from %s) is not on disk - curating the runner's action cache as-is, without parent attribution. "+
 		"The workspace has no checkout this early in the job; pass --workflow-file to attribute against a copy fetched over the API.",
 		workflowFile, githubactions.WorkflowRefEnvVar))
-	return nil, c.actionsCacheDir, false, nil
+	return nil, false, nil
 }
 
 // resolveArtifactoryVcsRepo returns the Artifactory VCS repository whose curation policies
-// govern this job, looked up from the GitHub repository running it. githubRepoName is available in all runners and the
-// argument which command takes is for the purpose of testing
+// govern this job, looked up from the GitHub repository running it. GITHUB_REPOSITORY is set on
+// every runner; the --github-repo override exists for local and test invocations.
 func (c *CurationActionsCommand) resolveArtifactoryVcsRepo(ctx context.Context) (string, error) {
 	githubRepo := c.githubRepo
 	if githubRepo == "" {
@@ -253,12 +241,8 @@ func (c *CurationActionsCommand) resolveArtifactoryVcsRepo(ctx context.Context) 
 	return repo, nil
 }
 
-// recordSummary records the report through the same "security" job-summary manager
-// curation-audit already uses (output.RecordSecurityCommandSummary), so it's picked up by the
-// existing generate-summary-markdown pipeline with no changes needed outside this repo. This is
-// a no-op when JFROG_CLI_COMMAND_SUMMARY_OUTPUT_DIR isn't set (e.g. a local/manual run) - the
-// console log above is what carries the result in that case.
-func (c *CurationActionsCommand) recordSummary(rows []githubactions.ActionReportRow, target string, attributed bool) error {
+// recordSummary records the report through the "security" job-summary manager
+func (c *CurationActionsCommand) recordSummary(rows []githubactions.ActionReportRow, attributed bool) error {
 	actions := make([]formats.CuratedAction, 0, len(rows))
 	for _, row := range rows {
 		actions = append(actions, formats.CuratedAction{
@@ -269,5 +253,5 @@ func (c *CurationActionsCommand) recordSummary(rows []githubactions.ActionReport
 			Notes:  row.Notes,
 		})
 	}
-	return output.RecordSecurityCommandSummary(output.NewCurationActionsSummary(actions, target, attributed))
+	return output.RecordSecurityCommandSummary(output.NewCurationActionsSummary(actions, attributed))
 }
