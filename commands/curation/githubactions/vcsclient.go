@@ -183,7 +183,8 @@ func (c *vcsClient) Download(repoKey, owner, repo string, ref ResolvedRef) (io.R
 	if err != nil {
 		return nil, "", err
 	}
-	// ext is explicit: GitHub Enterprise remotes default to zip, and the override unpacks tar.gz.
+	// ext is explicit: GitHub Enterprise remotes default to zip, and the comparison with the runner's
+	// copy reads tar.gz.
 	endpoint := c.repoEndpoint(api, repoKey, owner, repo) + "/" + escapeRefPath(ref.APIRef) + "?ext=" + vcsArchiveExtension
 	body, resp, err := c.get(endpoint)
 	if err != nil {

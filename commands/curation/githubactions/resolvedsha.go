@@ -14,11 +14,11 @@ var archiveExtensions = []string{".tar.gz", ".tgz", ".zip", ".tar"}
 // leading "v" stripped. The filename's shape varies - "<repo>-<sha>" for a commit,
 // "<repo>-<branch>-<sha>" for a branch, "<lastSegment>-<sha>" for a slashed branch, where the repo
 // is dropped - so the SHA is recognized by being a trailing 40- or 64-hex segment, not by
-// position. Tags carry no SHA yet ("<repo>-<tag>"); one appears here without a code change once
-// Artifactory adds it.
+// position. Older Artifactory versions name a tag's archive "<repo>-<tag>", with no SHA; a SHA
+// appears here without a code change on versions that add one.
 //
 // Best-effort by design: a missing or unexpected name costs the report its SHA note, never the
-// curation, since the action's content was already replaced.
+// curation, since the verdict comes from comparing content and never depends on the SHA.
 func ExtractResolvedSHA(filename string) string {
 	stem := filename
 	for _, ext := range archiveExtensions {

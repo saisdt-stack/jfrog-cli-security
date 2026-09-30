@@ -15,12 +15,12 @@ When to use:
 
 Which policies apply: the Artifactory repository governing the job, looked up from the GitHub repository running it (GITHUB_REPOSITORY). The mapping is curation-side configuration. If it cannot be resolved the command fails.
 
-How each action is decided: it is evaluated against the curation policies configured using the ref the runner resolved - a tag, a branch or a commit. An approved action's content replaces the runner's copy in its cache; for a branch or a commit, the report's Notes shows the SHA Artifactory resolved it to (tags carry none yet). A blocked action is reported Rejected with Artifactory's block reason in Notes, and the runner's copy is left as it was.
+How each action is decided: it is evaluated against the curation policies configured using the ref the runner resolved - a tag, a branch or a commit. For an approved action, the command then verifies that the runner's copy in its cache is the version Artifactory approved, by comparing it with the content Artifactory served. Identical content is reported Approved, with the SHA Artifactory resolved it to in Notes when known. Different content is reported Rejected with 'not able to decide since content is mismatched' and the first differing file in Notes. A blocked action is reported Rejected with Artifactory's block reason in Notes. The command never modifies the runner's copy of any action. Run it as the first step of the job, before any action it curates has run.
 
 Prerequisites:
 - Must run on a GitHub Actions runner. What is curated comes from the runner environment (RUNNER_WORKSPACE, GITHUB_WORKFLOW_REF, GITHUB_JOB, GITHUB_REPOSITORY). Outside a runner those are unset and the command reports an error.
 - A JFrog server configured (jf config, or jfrog/setup-jfrog-cli earlier in the job). The default server is used; to pick another, set JFROG_CLI_SERVER_ID to its server ID. setup-jfrog-cli's server is the default only when it is the first one configured, so on a runner that already has a JFrog config, or when a JF_ENV_* config token is also set, point at it explicitly: JFROG_CLI_SERVER_ID=setup-jfrog-cli-server (or the action's custom-server-id).
-- For a self-signed or internal-CA Artifactory, add its CA certificate to the runner's trust store or to ~/.jfrog/security/certs. TLS verification cannot be turned off for this command, because it replaces the action code the runner executes.
+- For a self-signed or internal-CA Artifactory, add its CA certificate to the runner's trust store or to ~/.jfrog/security/certs. TLS verification cannot be turned off for this command, because it decides whether the job may run the action code.
 
 Flags:
 - --threads: how many actions are decided at once (default 3).
@@ -40,6 +40,8 @@ Gotchas:
 - Attribution can be wrong inside a called reusable workflow and is a known limitation in parsing because of incorrect information github refs hold.
 - If no workflow file can be used, curation still runs against every action in the runner's cache, but without parent attribution - the report omits the Parent column and carries the 'Not covered' line described above. That covers every case where the file cannot be read or understood: nothing identified a workflow; GITHUB_WORKFLOW_REF named a file that is not on disk, which is normal early in a job since the workspace holds no checkout yet; the file does not declare the job being curated; or the YAML cannot be parsed. Coverage never changes - every action in the cache is decided either way - only the report's detail does.
 - A workflow file that cannot be parsed does not fail the command but produces a non attributed report.
+- A tag or branch that moved between the runner downloading it (at "Set up job") and Artifactory resolving it - or one Artifactory still serves from its cache - gives two different versions. The action is then reported Rejected with 'not able to decide since content is mismatched' and the job fails; re-running the job resolves both to the same version. A full commit SHA ref never mismatches this way.
+- Files an action or its pre step writes into its own directory are ignored; only the files of the approved version are compared.
 
 Related: jf curation-audit
 
@@ -58,6 +60,9 @@ A: No - a called reusable workflow runs its jobs on their own runners, so add jf
 
 Q: Why does a green report still say "Not covered"?
 A: An all-Approved table covers the actions the runner had already resolved when the check ran. Local composite actions ('uses: ./...') resolve their own references later in the job, so the report states that boundary rather than letting the table read as full coverage.
+
+Q: Does it change the actions on the runner?
+A: No. It only reads the runner's copy of each action and compares it with the version Artifactory approved; a mismatch is reported Rejected and fails the job.
 
 Q: Does this curate a step that uses docker://<image>?
 A: No - the runner pulls that image during job setup rather than into the action cache, so it never reaches this scan. Curate it with jf curation-audit --image <image>.

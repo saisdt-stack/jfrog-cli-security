@@ -5,7 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +87,24 @@ func approvingArtifactory(t *testing.T, filename string) *fakeArtifactory {
 	}
 }
 
+// isolateTempDir points the OS temp dir at a fresh directory and returns it, so a test can prove
+// Decide leaves no spooled archive behind.
+func isolateTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, dir)
+	}
+	return dir
+}
+
+func assertNoSpoolLeft(t *testing.T, tempDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(tempDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "Decide left its spooled archive behind")
+}
+
 func TestArtifactoryDeciderApproves(t *testing.T) {
 	const checkoutV4Commit = "11d5960a326750d5838078e36cf38b85af677262"
 	tests := []struct {
@@ -149,8 +167,11 @@ func TestArtifactoryDeciderApproves(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			tempDir := isolateTempDir(t)
 			fake := approvingArtifactory(t, tt.filename)
+			// The runner's copy sits under its literal ref and matches the served archive.
 			actionDir := runnerCache(t, tt.ref)
+			before := snapshotDir(t, actionDir)
 			ref := ActionRef{Owner: tt.owner, Repo: tt.repo, Ref: tt.ref, Path: actionDir}
 
 			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
@@ -158,9 +179,123 @@ func TestArtifactoryDeciderApproves(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, ActionCurationResult{Status: ActionApproved, Notes: tt.wantNotes}, got)
 			assert.Equal(t, tt.wantRequests, fake.recorded())
-			// The served content lands where the runner put the action, under its literal ref.
-			assert.Equal(t, "name: curated\n", readFile(t, filepath.Join(actionDir, "action.yml")))
-			assert.NoFileExists(t, filepath.Join(actionDir, "stale.js"))
+			assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
+			assertNoSpoolLeft(t, tempDir)
+		})
+	}
+}
+
+func TestArtifactoryDeciderContentMismatch(t *testing.T) {
+	top := "checkout-" + branchTip + "/"
+	tests := []struct {
+		name          string
+		ref           string
+		servedArchive []tarEntry
+		filename      string
+		wantNotes     string
+	}{
+		{
+			name: "verify when a served file differs from the runner's then the verdict is Rejected naming it",
+			ref:  "v4",
+			servedArchive: []tarEntry{
+				{name: top, dir: true},
+				{name: top + "action.yml", content: "name: moved\n"},
+			},
+			filename:  "checkout-v4.tar.gz",
+			wantNotes: "not able to decide since content is mismatched (action.yml differs)",
+		},
+		{
+			name: "verify when a served file is missing on the runner then the verdict is Rejected naming it",
+			ref:  "v4",
+			servedArchive: []tarEntry{
+				{name: top, dir: true},
+				{name: top + "action.yml", content: "name: curated\n"},
+				{name: top + "dist/new.js", content: "new();\n"},
+			},
+			filename:  "checkout-v4.tar.gz",
+			wantNotes: "not able to decide since content is mismatched (dist/new.js missing on the runner)",
+		},
+		{
+			name: "verify when a mismatch has a resolved SHA then the notes carry it",
+			ref:  "main",
+			servedArchive: []tarEntry{
+				{name: top, dir: true},
+				{name: top + "action.yml", content: "name: moved\n"},
+			},
+			filename:  "checkout-main-" + branchTip + ".tar.gz",
+			wantNotes: "not able to decide since content is mismatched (action.yml differs); resolved SHA: " + branchTip,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tempDir := isolateTempDir(t)
+			fake := approvingArtifactory(t, tt.filename)
+			fake.downloadBody = buildTarGz(t, tt.servedArchive...)
+			actionDir := runnerCache(t, tt.ref)
+			before := snapshotDir(t, actionDir)
+			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: actionDir}
+
+			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+
+			require.NoError(t, err, "a content mismatch is a verdict, not an error")
+			assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: tt.wantNotes}, got)
+			assert.True(t, strings.HasPrefix(got.Notes, contentMismatchNote), "Notes = %q, want the searchable prefix %q", got.Notes, contentMismatchNote)
+			assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
+			assertNoSpoolLeft(t, tempDir)
+		})
+	}
+}
+
+func TestArtifactoryDeciderResolvedSHASource(t *testing.T) {
+	top := "checkout-" + branchTip + "/"
+	tests := []struct {
+		name      string
+		paxSHA    string
+		filename  string
+		wantNotes string
+	}{
+		{
+			name:      "verify when only the archive's pax header has a SHA then it is noted",
+			paxSHA:    tagCommit,
+			filename:  "checkout-v4.tar.gz",
+			wantNotes: resolvedSHANotePrefix + tagCommit,
+		},
+		{
+			// An annotated tag's filename can name the tag object, while the header names the commit.
+			name:      "verify when the filename and pax header disagree then the pax SHA is noted",
+			paxSHA:    tagCommit,
+			filename:  "checkout-v4-" + tagObject + ".tar.gz",
+			wantNotes: resolvedSHANotePrefix + tagCommit,
+		},
+		{
+			name:      "verify when only the filename has a SHA then it is noted",
+			filename:  "checkout-v4-" + tagObject + ".tar.gz",
+			wantNotes: resolvedSHANotePrefix + tagObject,
+		},
+		{
+			name:     "verify when neither has a SHA then no note is made",
+			filename: "checkout-v4.tar.gz",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entries := []tarEntry{
+				{name: top, dir: true},
+				{name: top + "action.yml", content: "name: curated\n"},
+				{name: top + "dist/", dir: true},
+				{name: top + "dist/index.js", content: "curated();\n"},
+			}
+			if tt.paxSHA != "" {
+				entries = append([]tarEntry{{pax: map[string]string{"comment": tt.paxSHA}}}, entries...)
+			}
+			fake := approvingArtifactory(t, tt.filename)
+			fake.downloadBody = buildTarGz(t, entries...)
+			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: runnerCache(t, "v4")}
+
+			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+
+			require.NoError(t, err)
+			assert.Equal(t, ActionCurationResult{Status: ActionApproved, Notes: tt.wantNotes}, got)
 		})
 	}
 }
@@ -172,13 +307,14 @@ func TestArtifactoryDeciderRejects(t *testing.T) {
 			downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope),
 		}
 		actionDir := runnerCache(t, "v4")
+		before := snapshotDir(t, actionDir)
 		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: actionDir}
 
 		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
 
 		require.NoError(t, err, "a curation block is a verdict, not an error")
 		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions"}, got)
-		assertOriginalIntact(t, actionDir)
+		assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
 	})
 }
 
@@ -221,10 +357,21 @@ func TestArtifactoryDeciderErrors(t *testing.T) {
 			fake: &fakeArtifactory{refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusOK, downloadBody: []byte("not a tarball")},
 			ref:  "v4", wantRequests: 2,
 		},
+		{
+			// Comparing nothing must not approve the runner's copy.
+			name: "verify when the served archive holds only its top directory then it errors",
+			fake: &fakeArtifactory{
+				refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusOK,
+				downloadBody: buildTarGz(t, tarEntry{name: "checkout-" + branchTip + "/", dir: true}),
+			},
+			ref: "v4", wantRequests: 2,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			tempDir := isolateTempDir(t)
 			actionDir := runnerCache(t, tt.ref)
+			before := snapshotDir(t, actionDir)
 			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: actionDir}
 
 			got, err := newTestDecider(t, tt.fake).Decide(context.Background(), testRepoKey, ref)
@@ -234,7 +381,8 @@ func TestArtifactoryDeciderErrors(t *testing.T) {
 			assert.Equal(t, tt.wantDenied, errors.Is(err, ErrAccessDenied), "Decide() error = %v, want errors.Is(ErrAccessDenied) = %v", err, tt.wantDenied)
 			assert.Equal(t, tt.wantNotFound, errors.Is(err, ErrRefNotAdvertised), "Decide() error = %v, want errors.Is(ErrRefNotAdvertised) = %v", err, tt.wantNotFound)
 			assert.Len(t, tt.fake.recorded(), tt.wantRequests)
-			assertOriginalIntact(t, actionDir)
+			assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
+			assertNoSpoolLeft(t, tempDir)
 		})
 	}
 }

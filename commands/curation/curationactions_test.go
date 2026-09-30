@@ -1,10 +1,16 @@
 package curation
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1180,4 +1186,105 @@ func TestCurationActionsCommand_Run_RequiresAServerWithoutATestDecider(t *testin
 			assert.ErrorContains(t, err, "no JFrog server is configured")
 		})
 	}
+}
+
+// actionTarGz builds a tar.gz shaped like Artifactory's VCS archive: files under one top directory.
+func actionTarGz(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	require.NoError(t, tw.WriteHeader(&tar.Header{Name: "action-top/", Mode: 0o755, Typeflag: tar.TypeDir}))
+	for _, name := range slices.Sorted(maps.Keys(files)) {
+		content := files[name]
+		require.NoError(t, tw.WriteHeader(&tar.Header{Name: "action-top/" + name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}))
+		_, err := tw.Write([]byte(content))
+		require.NoError(t, err)
+	}
+	require.NoError(t, tw.Close())
+	require.NoError(t, gz.Close())
+	return buf.Bytes()
+}
+
+// snapshotTree records every file below dir with its content, so a test can prove it is unchanged.
+func snapshotTree(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	snapshot := map[string]string{}
+	require.NoError(t, filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		snapshot[path] = string(content)
+		return err
+	}))
+	return snapshot
+}
+
+func TestCurationActionsCommand_Run_ContentMismatchIsReportedAndFailsTheGate(t *testing.T) {
+	// The real decider, so the mismatch comes from comparing the served archive with the runner's
+	// copy. Full-SHA refs keep git refs out of it: ref resolution is covered by the decider's tests.
+	const (
+		shaOne   = "1111111111111111111111111111111111111111"
+		shaTwo   = "2222222222222222222222222222222222222222"
+		shaThree = "3333333333333333333333333333333333333333"
+		vcsRepo  = "github-vcs"
+	)
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(coreutils.SummaryOutputDirPathEnv, t.TempDir())
+	runnerYAML := map[string]string{"one": "name: one\n", "two": "name: two\n", "three": "name: three\n"}
+	served := map[string][]byte{
+		"downloadCommit/" + vcsRepo + "/acme/one/" + shaOne:     actionTarGz(t, map[string]string{"action.yml": runnerYAML["one"]}),
+		"downloadCommit/" + vcsRepo + "/acme/two/" + shaTwo:     actionTarGz(t, map[string]string{"action.yml": "name: moved\n"}),
+		"downloadCommit/" + vcsRepo + "/acme/three/" + shaThree: actionTarGz(t, map[string]string{"action.yml": runnerYAML["three"]}),
+	}
+	var mu sync.Mutex
+	var requested []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.URL.Path, "/artifactory/api/vcs/")
+		mu.Lock()
+		requested = append(requested, key)
+		mu.Unlock()
+		archive, ok := served[key]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write(archive)
+	}))
+	t.Cleanup(server.Close)
+	decider, err := githubactions.NewArtifactoryActionCurationDecider(&config.ServerDetails{
+		ArtifactoryUrl: server.URL + "/artifactory/",
+		AccessToken:    "test-token",
+	})
+	require.NoError(t, err)
+	spec := runnerSpec{
+		cacheDirs: []string{"acme/one/" + shaOne, "acme/two/" + shaTwo, "acme/three/" + shaThree},
+		cacheFiles: map[string]string{
+			"acme/one/" + shaOne + "/action.yml":     runnerYAML["one"],
+			"acme/two/" + shaTwo + "/action.yml":     runnerYAML["two"],
+			"acme/three/" + shaThree + "/action.yml": runnerYAML["three"],
+		},
+	}
+	workingDir, actionsCacheDir := spec.build(t)
+	before := snapshotTree(t, actionsCacheDir)
+	cmd := NewCurationActionsCommand().
+		SetWorkingDir(workingDir).
+		SetActionsCacheDir(actionsCacheDir).
+		SetVcsRepoResolver(&fixedResolver{repo: vcsRepo}).
+		SetDecider(decider)
+
+	report, err := captureReport(t, cmd)
+
+	const mismatch = "not able to decide since content is mismatched (action.yml differs)"
+	assert.ElementsMatch(t, slices.Collect(maps.Keys(served)), requested, "every action must be decided")
+	assert.Contains(t, report, "| acme/one | "+shaOne+" | Approved |  |")
+	assert.Contains(t, report, "| acme/two | "+shaTwo+" | Rejected | "+mismatch+" |")
+	assert.Contains(t, report, "| acme/three | "+shaThree+" | Approved |  |")
+	require.Error(t, err, "a content mismatch must fail the gate")
+	assert.ErrorContains(t, err, "acme/two@"+shaTwo)
+	assert.ErrorContains(t, err, mismatch)
+	assert.NotContains(t, err.Error(), "acme/one", "an approved action must not be named by the gate")
+	assert.NotContains(t, err.Error(), "acme/three", "an approved action must not be named by the gate")
+	assert.Equal(t, before, snapshotTree(t, actionsCacheDir), "the runner's action cache was modified")
 }
