@@ -170,6 +170,10 @@ const (
 	MvnIncludePluginDeps  = "mvn-include-plugin-deps"
 	Script                = "script"
 	ActionsThreads        = "actions-" + Threads
+	RunnerHook            = "runner-hook"
+	RunnerDir             = "runner-dir"
+	InstallRunnerHook     = "install-runner-hook"
+	UninstallRunnerHook   = "uninstall-runner-hook"
 
 	// Unique git flags
 	gitPrefix       = "git-"
@@ -236,7 +240,7 @@ var commandFlags = map[string][]string{
 	CurationAudit: {
 		CurationOutput, WorkingDirs, Threads, RequirementsFile, InsecureTls, useWrapperAudit, UseIncludedBuilds, SolutionPath, DockerImageName, HuggingFaceModel, IncludeCachedPackages, MvnIncludePluginDeps, LegacyPeerDeps, RunNative, Script,
 	},
-	CurationActions: {ActionsThreads},
+	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook},
 	GitCountContributors: {
 		InputFile, ScmType, ScmApiUrl, Token, Owner, RepoName, Months, DetailedSummary, InsecureTls, GitThreads, CacheValidity,
 	},
@@ -362,6 +366,10 @@ var flagsMap = map[string]components.Flag{
 	RunNative:                     components.NewBoolFlag(RunNative, "[npm] Use the native npm client for dependency resolution. Reads Artifactory URL and repository from the project's .npmrc registry — no 'jf npm-config' required. Respects .npmrc and Volta configuration."),
 	Script:                        components.NewStringFlag(Script, "[uv] Path to a PEP 723 inline-script .py file to audit standalone, instead of scanning the working directory for a pyproject.toml/uv.lock project."),
 	ActionsThreads:                components.NewStringFlag(Threads, "The number of GitHub Actions curated in parallel.", components.WithIntDefaultValue(cliutils.Threads)),
+	RunnerHook:                    components.NewBoolFlag(RunnerHook, "Run as a self-hosted runner's job-started hook. Set by the script --install-runner-hook writes.", components.SetHiddenBoolFlag()),
+	RunnerDir:                     components.NewStringFlag(RunnerDir, "The self-hosted runner's installation directory (the one holding config.sh)."),
+	InstallRunnerHook:             components.NewBoolFlag(InstallRunnerHook, "Install this command as the job-started hook of the self-hosted runner in --runner-dir. A runner-admin operation, refused inside a job. Restart the runner service afterwards."),
+	UninstallRunnerHook:           components.NewBoolFlag(UninstallRunnerHook, "Remove the job-started hook installed by --install-runner-hook from the runner in --runner-dir, restoring any hook it chained. Restart the runner service afterwards."),
 	binarySca:                     components.NewBoolFlag(Sca, fmt.Sprintf("Selective scanners mode: Execute SCA (Software Composition Analysis) sub-scan. Use --%s to run both SCA and Contextual Analysis. Use --%s --%s to to run SCA. Can be combined with --%s.", Sca, Sca, WithoutCA, Secrets)),
 	binarySecrets:                 components.NewBoolFlag(Secrets, fmt.Sprintf("Selective scanners mode: Execute Secrets sub-scan. Can be combined with --%s.", Sca)),
 	binaryWithoutCA:               components.NewBoolFlag(WithoutCA, fmt.Sprintf("Selective scanners mode: Disable Contextual Analysis scanner after SCA. Relevant only with --%s flag.", Sca)),

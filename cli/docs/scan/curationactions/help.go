@@ -22,8 +22,15 @@ Prerequisites:
 - A JFrog server configured (jf config, or jfrog/setup-jfrog-cli earlier in the job). The default server is used; to pick another, set JFROG_CLI_SERVER_ID to its server ID. setup-jfrog-cli's server is the default only when it is the first one configured, so on a runner that already has a JFrog config, or when a JF_ENV_* config token is also set, point at it explicitly: JFROG_CLI_SERVER_ID=setup-jfrog-cli-server (or the action's custom-server-id).
 - For a self-signed or internal-CA Artifactory, add its CA certificate to the runner's trust store or to ~/.jfrog/security/certs. TLS verification cannot be turned off for this command, because it decides whether the job may run the action code.
 
+Self-hosted runners: a runner admin can run the check before every job on a machine, as the runner's job-started hook, instead of as a workflow step:
+  $ jf curate-gh-actions --install-runner-hook --runner-dir /opt/actions-runner [--server-id <id>]
+then restart the runner service. The hook runs before any step, so a workflow cannot skip it, and it reads the runner's own logs to report the SHA the runner fetched for each action and whether it came from the runner's action cache. It then decides each action by that exact commit, so Artifactory's curation audit shows the commit SHA rather than the tag or branch in the workflow, and the runner's copy is not compared: the runner's action cache is the admin's and is trusted to hold what its SHA names. If the logs cannot name an action's commit, that action is curated exactly as the step does, by its ref and by comparing content. Make the hook script, the jf binary and the jf configuration writable by the admin only: a job runs as the runner's user. Remove the hook with --uninstall-runner-hook. Install is refused inside a GitHub Actions job. Not supported on Windows yet.
+
 Flags:
 - --threads: how many actions are decided at once (default 3).
+- --install-runner-hook / --uninstall-runner-hook: add or remove the job-started hook on the self-hosted runner in --runner-dir.
+- --runner-dir: the runner's installation directory.
+- --server-id: the configured JFrog server the installed hook uses.
 
 Common patterns:
   $ jf curate-gh-actions

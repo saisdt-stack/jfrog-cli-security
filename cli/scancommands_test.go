@@ -22,6 +22,7 @@ import (
 	flags "github.com/jfrog/jfrog-cli-security/cli/docs"
 	"github.com/jfrog/jfrog-cli-security/utils/techutils"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var TestDataDir = filepath.Join("..", "tests", "testdata")
@@ -202,6 +203,36 @@ func TestEffectiveIncludeViolations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, EffectiveIncludeViolations(tt.violationsFlag, tt.projectProvided))
+		})
+	}
+}
+
+func TestCurationActionsMode(t *testing.T) {
+	tests := []struct {
+		name                       string
+		runnerHook, install, unins bool
+		runnerDir                  string
+		want                       curationActionsRunMode
+		wantErr                    string
+	}{
+		{name: "verify when no flag is set then it runs as a step", want: curateAsStep},
+		{name: "verify when runner-hook is set with a runner dir then it runs as the hook", runnerHook: true, runnerDir: "/r", want: curateAsHook},
+		{name: "verify when runner-hook is set without a runner dir then it fails", runnerHook: true, wantErr: "--runner-dir"},
+		{name: "verify when install is set with a runner dir then it installs", install: true, runnerDir: "/r", want: installHook},
+		{name: "verify when uninstall is set with a runner dir then it uninstalls", unins: true, runnerDir: "/r", want: uninstallHook},
+		{name: "verify when install is set without a runner dir then it fails", install: true, wantErr: "--runner-dir"},
+		{name: "verify when two modes are set then it fails", install: true, runnerHook: true, runnerDir: "/r", wantErr: "only one of"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.runnerDir)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

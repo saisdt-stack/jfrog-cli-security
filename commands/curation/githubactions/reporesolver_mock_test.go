@@ -8,6 +8,7 @@ import (
 )
 
 func TestMockArtifactoryVcsRepoResolver(t *testing.T) {
+	t.Setenv(VcsRepoOverrideEnvVar, "")
 	tests := []struct {
 		name       string
 		githubRepo string
@@ -35,4 +36,26 @@ func TestMockArtifactoryVcsRepoResolver(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestMockArtifactoryVcsRepoResolverOverride(t *testing.T) {
+	t.Run("verify when the override is set then every repository resolves to it", func(t *testing.T) {
+		t.Setenv(VcsRepoOverrideEnvVar, "github-actions-remote")
+		for _, githubRepo := range []string{"my-org/my-repo", "other-org/x"} {
+			got, err := NewMockArtifactoryVcsRepoResolver().Resolve(context.Background(), githubRepo)
+			assert.NoError(t, err)
+			assert.Equal(t, "github-actions-remote", got)
+		}
+	})
+	t.Run("verify when the override is set then a malformed repository is still rejected", func(t *testing.T) {
+		t.Setenv(VcsRepoOverrideEnvVar, "github-actions-remote")
+		_, err := NewMockArtifactoryVcsRepoResolver().Resolve(context.Background(), "no-slash")
+		assert.Error(t, err)
+	})
+	t.Run("verify when the override is empty then the key derives from the owner", func(t *testing.T) {
+		t.Setenv(VcsRepoOverrideEnvVar, "")
+		got, err := NewMockArtifactoryVcsRepoResolver().Resolve(context.Background(), "my-org/my-repo")
+		assert.NoError(t, err)
+		assert.Equal(t, "my-org"+mockVcsRepoSuffix, got)
+	})
 }
