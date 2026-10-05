@@ -744,7 +744,7 @@ func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T
 			// not on disk and the command cannot tell whether a local action is declared.
 			spec:         runnerSpec{cacheDirs: []string{"actions/checkout/v4"}},
 			mode:         noWorkflowFile,
-			wantContains: []string{"Not covered", "no workflow file was available"},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated"},
 		},
 		{
 			name: "verify when the workflow does not declare the job then the caveat is unconditional",
@@ -755,7 +755,7 @@ func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T
 			},
 			mode:         writtenWorkflowFile,
 			jobID:        "build",
-			wantContains: []string{"Not covered", "no workflow file was available"},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated"},
 		},
 		{
 			name: "verify when a composite declares a local step then the caveat names it and its declarer",
@@ -782,7 +782,7 @@ func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T
 				},
 			},
 			mode:            noWorkflowFile,
-			wantContains:    []string{"Not covered", "no workflow file was available"},
+			wantContains:    []string{"Local composite actions (uses: ./...) are not curated"},
 			wantNotContains: []string{"./scripts/build"},
 		},
 		{
@@ -867,7 +867,7 @@ func TestCurationActionsCommand_Run_UnreadableWorkflowFileFallsBackRatherThanFai
 	assert.Equal(t, []string{"actions/checkout@v4"}, decider.asked, "the cache is curated in full regardless")
 	// Attribution is gone, and the report says so rather than passing silently.
 	assert.NotContains(t, report, "| Action | Ref | Parent |", "a run with no attribution must not render a Parent column")
-	assert.Contains(t, report, "no workflow file was available")
+	assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
 }
 
 func TestCurationActionsCommand_Run_ErrorHandlingHookAppliesToFailuresNotOutcomes(t *testing.T) {
@@ -1289,10 +1289,43 @@ func TestCurationActionsCommand_Run_ContentMismatchIsReportedAndFailsTheGate(t *
 	assert.Equal(t, before, snapshotTree(t, actionsCacheDir), "the runner's action cache was modified")
 }
 
-func TestNotApprovedErrorNamesTheRunnerSHA(t *testing.T) {
-	err := notApprovedError([]githubactions.ActionReportRow{
-		{Action: "actions/checkout", Ref: "v3", RunnerSHA: "a37ce912", Status: "Rejected", Notes: "blocked"},
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "actions/checkout@v3 (runner SHA a37ce912): status \"Rejected\" - blocked")
+func TestCurationActionsCommand_Run_AttributesOnlyFromTheCommitBeingRun(t *testing.T) {
+	// A persistent self-hosted runner keeps the workspace between jobs, so the workflow file found
+	// there may be from another commit an earlier job checked out. It describes this job only when
+	// the checkout is at the commit this job runs.
+	const runSHA = "ac28ebad35b91c09ec81aab0ceeb2517d0c96145"
+	const otherSHA = "2fe6323c9d78da97e1a802f768ec291d1e59d794"
+	tests := []struct {
+		name         string
+		gitHead      string // "" leaves no checkout in the workspace
+		wantAttribed bool
+	}{
+		{name: "verify when the checkout is at the commit being run then the workflow file is used", gitHead: runSHA, wantAttribed: true},
+		{name: "verify when the checkout is at another commit then the workflow file is ignored", gitHead: otherSHA},
+		{name: "verify when the workspace has no checkout then the workflow file is ignored"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, derivedWorkflowRef, "build")
+			t.Setenv(githubactions.GithubSHAEnvVar, runSHA)
+			spec := runnerSpec{
+				cacheDirs:    []string{"actions/checkout/v4"},
+				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - uses: ./.github/actions/stale-only\n",
+			}
+			workingDir, cacheDir := spec.build(t)
+			if tt.gitHead != "" {
+				require.NoError(t, os.MkdirAll(filepath.Join(workingDir, ".git"), 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(workingDir, ".git", "HEAD"), []byte(tt.gitHead+"\n"), 0o644))
+			}
+			cmd := NewCurationActionsCommand().SetWorkingDir(workingDir).SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{})
+			report, err := captureReport(t, cmd)
+			require.NoError(t, err)
+			if tt.wantAttribed {
+				assert.Contains(t, report, "./.github/actions/stale-only")
+				return
+			}
+			assert.NotContains(t, report, "./.github/actions/stale-only")
+			assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
+		})
+	}
 }

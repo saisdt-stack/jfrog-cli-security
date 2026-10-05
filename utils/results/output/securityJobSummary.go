@@ -461,18 +461,7 @@ func GenerateActionsCurationSectionMarkdown(actionsData []formats.ResultsSummary
 			break
 		}
 	}
-	withProvenance := false
-	for _, actions := range curated {
-		for _, action := range actions.Actions {
-			if action.RunnerSHA != "" || action.Source != "" {
-				withProvenance = true
-			}
-		}
-	}
 	headers := []string{"Action", "Ref"}
-	if withProvenance {
-		headers = append(headers, "Runner SHA", "Source")
-	}
 	if withParent {
 		headers = append(headers, "Parent")
 	}
@@ -485,9 +474,6 @@ func GenerateActionsCurationSectionMarkdown(actionsData []formats.ResultsSummary
 	for _, actions := range curated {
 		for _, action := range actions.Actions {
 			cells := []string{cell(action.Action), cell(action.Ref)}
-			if withProvenance {
-				cells = append(cells, cell(action.RunnerSHA), cell(action.Source))
-			}
 			if withParent {
 				cells = append(cells, cell(action.Parent))
 			}

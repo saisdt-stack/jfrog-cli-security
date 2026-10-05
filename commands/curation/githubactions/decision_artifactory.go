@@ -73,7 +73,14 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 	body, filename, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
 	var blocked *BlockedError
 	if errors.As(err, &blocked) {
-		return ActionCurationResult{Status: ActionRejected, Notes: blocked.Reason}, nil
+		// A block serves no archive to read the commit from, so the commit is named only when the
+		// request named it - the verdict is then on that exact commit. A tag or branch is resolved by
+		// Artifactory, and which commit it chose is not reported.
+		sha := ""
+		if resolved.Kind == RefKindCommit {
+			sha = resolved.APIRef
+		}
+		return ActionCurationResult{Status: ActionRejected, Notes: blockedNotes(blocked.Reason, sha)}, nil
 	}
 	if err != nil {
 		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
@@ -111,14 +118,14 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 // up and the runner's copy is not compared: the commit identifies the content, and the runner's
 // action cache is the admin's, trusted to hold what its SHA names.
 //
-// Because the request names the commit, Artifactory's curation audit records this action by its SHA,
+// Because the request names the commit, curation audit records this action by its SHA,
 // not by the tag or branch the workflow wrote.
 func (d *artifactoryActionCurationDecider) decideRunnerCommit(artifactoryVcsRepo, owner, repo, sha string) (ActionCurationResult, error) {
 	resolved := ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(sha)}
 	body, _, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
 	var blocked *BlockedError
 	if errors.As(err, &blocked) {
-		return ActionCurationResult{Status: ActionRejected, Notes: blocked.Reason}, nil
+		return ActionCurationResult{Status: ActionRejected, Notes: blockedNotes(blocked.Reason, resolved.APIRef)}, nil
 	}
 	if err != nil {
 		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
@@ -161,6 +168,14 @@ func resolvedSHA(filename, paxSHA string) string {
 		return paxSHA
 	}
 	return filenameSHA
+}
+
+// blockedNotes is the Notes of an action curation blocked, naming sha when it is known.
+func blockedNotes(reason, sha string) string {
+	if sha == "" {
+		return reason
+	}
+	return reason + "; " + resolvedSHANotePrefix + sha
 }
 
 func mismatchNotes(comparison ArchiveComparison, sha string) string {

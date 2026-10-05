@@ -96,13 +96,11 @@ type LocalCompositeAction struct {
 
 // CuratedAction is the curation outcome for one resolved GitHub Action.
 type CuratedAction struct {
-	Action    string `json:"action"`               // "owner/repo", plus " (subpath[, subpath...])" when invoked via subpaths
-	Ref       string `json:"ref"`                  // verbatim from the cache directory name, uninterpreted
-	RunnerSHA string `json:"runner_sha,omitempty"` // the commit the runner fetched, when its logs were read
-	Source    string `json:"source,omitempty"`     // how the runner materialized it, when its logs were read
-	Parent    string `json:"parent,omitempty"`     // "" when directly referenced, or when attribution could not place it
-	Status    string `json:"status"`
-	Notes     string `json:"notes,omitempty"`
+	Action string `json:"action"`           // "owner/repo", plus " (subpath[, subpath...])" when invoked via subpaths
+	Ref    string `json:"ref"`              // verbatim from the cache directory name, uninterpreted
+	Parent string `json:"parent,omitempty"` // "" when directly referenced, or when attribution could not place it
+	Status string `json:"status"`
+	Notes  string `json:"notes,omitempty"`
 }
 
 func (cp *CuratedPackages) GetApprovedCount() int {

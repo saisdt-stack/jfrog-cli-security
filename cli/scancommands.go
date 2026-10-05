@@ -732,13 +732,13 @@ func CurationActionsCmd(c *components.Context) error {
 		for _, warning := range warnings {
 			log.Warn(warning)
 		}
-		log.Info("Installed the curate-gh-actions job-started hook. Restart the runner service for it to take effect.")
+		log.Info("Installed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
 		return nil
 	case uninstallHook:
 		if err = runnerhook.Uninstall(runnerDir); err != nil {
 			return err
 		}
-		log.Info("Removed the curate-gh-actions job-started hook. Restart the runner service for it to take effect.")
+		log.Info("Removed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
 		return nil
 	}
 	threads, err := pluginsCommon.GetThreadsCount(c)

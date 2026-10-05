@@ -141,6 +141,20 @@ func TestCrossReference(t *testing.T) {
 			wantSubpaths: map[string][]string{"checkout": nil},
 		},
 		{
+			name: "verify when an entry is used directly and by a composite then both are named",
+			discovered: []discoveredAction{
+				{key: "aquasecurity/setup-trivy@v1", yamls: map[string]string{"": compositeYAML("actions/cache/save@v4")}},
+				{key: "actions/cache@v4"},
+			},
+			used: []WorkflowUse{
+				{Owner: "actions", Repo: "cache", Ref: "v4", Subpath: "restore"},
+				{Owner: "aquasecurity", Repo: "setup-trivy", Ref: "v1"},
+			},
+			wantRepos:    []string{"setup-trivy", "cache"},
+			wantParents:  map[string]string{"cache": "direct; also via aquasecurity/setup-trivy@v1"},
+			wantSubpaths: map[string][]string{"cache": {"restore", "save"}},
+		},
+		{
 			name:         "verify when no workflow explains an entry then its parent stays empty rather than guessed",
 			discovered:   []discoveredAction{{key: "some-org/mystery-action@v1"}},
 			wantRepos:    []string{"mystery-action"},

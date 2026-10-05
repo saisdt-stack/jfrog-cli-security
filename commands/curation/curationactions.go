@@ -217,9 +217,6 @@ func notApprovedError(rows []githubactions.ActionReportRow) error {
 			msg.WriteString("curation policy did not approve every GitHub Action this job resolved:")
 		}
 		fmt.Fprintf(&msg, "\n  %s@%s", row.Action, row.Ref)
-		if row.RunnerSHA != "" {
-			fmt.Fprintf(&msg, " (runner SHA %s)", row.RunnerSHA)
-		}
 		fmt.Fprintf(&msg, ": status %q", row.Status)
 		if row.Notes != "" {
 			fmt.Fprintf(&msg, " - %s", row.Notes)
@@ -365,6 +362,25 @@ func (c *CurationActionsCommand) decideAll(ctx context.Context, decider githubac
 //
 // This also matches parseCompositeActionUses, which takes the same view of an action.yml it
 // cannot read.
+// staleCheckout says why the workspace checkout cannot be taken for the commit this job runs, or ""
+// when it is that commit. A persistent self-hosted runner keeps the workspace between jobs, so before
+// this job's own checkout it holds whatever an earlier job checked out. Off a runner GITHUB_SHA is
+// unset and nothing is checked.
+func staleCheckout(workingDir string) string {
+	want := os.Getenv(githubactions.GithubSHAEnvVar)
+	if want == "" {
+		return ""
+	}
+	got, err := githubactions.WorkspaceCommit(workingDir)
+	if err != nil {
+		return fmt.Sprintf("cannot tell which commit the workspace holds (%v)", err)
+	}
+	if !strings.EqualFold(got, want) {
+		return fmt.Sprintf("the workspace holds commit %s, not %s, which this job runs", got, want)
+	}
+	return ""
+}
+
 func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used githubactions.JobUses, attributed bool, err error) {
 	jobID := c.jobID
 	if jobID == "" {
@@ -384,6 +400,11 @@ func (c *CurationActionsCommand) parseWorkflowUses(workingDir string) (used gith
 		workflowFile = filepath.Join(workingDir, workflowFile)
 	}
 	if used, err = githubactions.ParseWorkflowUses(workflowFile, jobID); err == nil {
+		if stale := staleCheckout(workingDir); stale != "" {
+			log.Info(fmt.Sprintf("Workflow file %q may not be this job's: %s - curating the runner's action cache as-is, without parent attribution.",
+				workflowFile, stale))
+			return githubactions.JobUses{}, false, nil
+		}
 		return used, true, nil
 	}
 	switch {

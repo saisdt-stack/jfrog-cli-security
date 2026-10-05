@@ -94,7 +94,7 @@ func TestRenderActionsException(t *testing.T) {
 			// Saying nothing here would be the one case where an all-Approved table is most
 			// likely to be incomplete and least likely to admit it.
 			actions:      []CuratedActions{unattributed()},
-			wantContains: []string{"no workflow file was available", "uses: ./...", "not curated"},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated", "not covered in this report"},
 		},
 		{
 			// Two runs merged into one section: one found a local step, the other had no workflow

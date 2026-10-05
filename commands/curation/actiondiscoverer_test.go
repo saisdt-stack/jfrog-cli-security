@@ -157,7 +157,7 @@ func TestRunnerLogDiscoverer(t *testing.T) {
 	})
 }
 
-func TestCurationActionsCommand_Run_HookModeReportsTheRunnerSHA(t *testing.T) {
+func TestCurationActionsCommand_Run_HookModeReportHasTheStepModeColumns(t *testing.T) {
 	pinRunnerEnv(t, "octo/repo", "", "")
 	runnerDir, cacheDir := hookRunner(t, map[string]string{
 		"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
@@ -166,8 +166,8 @@ func TestCurationActionsCommand_Run_HookModeReportsTheRunnerSHA(t *testing.T) {
 	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetRunnerDir(runnerDir).SetDecider(&scriptedDecider{})
 	report, err := captureReport(t, cmd)
 	require.NoError(t, err)
-	assert.Contains(t, report, "| Runner SHA |")
-	assert.Contains(t, report, testShaV4)
+	assert.Contains(t, report, "| Action | Ref | Status | Notes |")
+	assert.NotContains(t, report, "Runner SHA")
 }
 
 func TestRunnerLogDiscovererAcceptsARenamedRepository(t *testing.T) {
@@ -197,7 +197,7 @@ func TestCurationActionsCommand_Run_HookModeDoesNotAttributeFromTheWorkspace(t *
 	report, err := captureReport(t, cmd)
 	require.NoError(t, err)
 	assert.NotContains(t, report, "| Parent |")
-	assert.Contains(t, report, "Not covered: no workflow file was available")
+	assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
 }
 
 func TestRunnerLogDiscovererSetupLineCoverage(t *testing.T) {

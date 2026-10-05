@@ -75,7 +75,7 @@ func TestGenerateActionsCurationSectionMarkdown(t *testing.T) {
 			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
 				CuratedActions: actions(false, formats.CuratedAction{Action: "actions/checkout", Ref: "v4", Status: "Approved"}),
 			}}}},
-			wantContains: []string{"Not covered", "no workflow file was available"},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated"},
 		},
 		{
 			name: "verify when attribution succeeded and no local action was declared then no caveat is rendered",
@@ -283,16 +283,4 @@ func TestGenerateActionsCurationSectionMarkdown_LocalActionSharedBySeveralScansI
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, strings.Count(markdown, "./.github/actions/setup"))
-}
-
-func TestGenerateActionsCurationSectionMarkdownProvenance(t *testing.T) {
-	data := []formats.ResultsSummary{{Scans: []formats.ScanSummary{{CuratedActions: &formats.CuratedActions{
-		Attributed: false,
-		Actions: []formats.CuratedAction{{Action: "actions/checkout", Ref: "v3",
-			RunnerSHA: "a37ce9120846195fa4ece8f58b268e6043cb2f26", Source: "Downloaded", Status: "Rejected", Notes: "blocked"}},
-	}}}}}
-	markdown, err := GenerateActionsCurationSectionMarkdown(data)
-	require.NoError(t, err)
-	assert.Contains(t, markdown, "| Action | Ref | Runner SHA | Source | Status | Notes |")
-	assert.Contains(t, markdown, "| actions/checkout | v3 | a37ce9120846195fa4ece8f58b268e6043cb2f26 | Downloaded | Rejected | blocked |")
 }

@@ -48,8 +48,7 @@ func RenderActionsException(actions []CuratedActions) string {
 	case len(localUses) == 0 && !anyUnattributed:
 		return ""
 	case len(localUses) == 0:
-		return "\nNot covered: no workflow file was available, so this report cannot tell whether this job reaches a local " +
-			"composite action (uses: ./...) which are not curated.\n"
+		return "\nLocal composite actions (uses: ./...) are not curated and hence are not covered in this report.\n"
 	}
 
 	subject := "a local composite action"

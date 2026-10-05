@@ -63,7 +63,7 @@ func (d runnerLogDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 	}
 	if diagErr != nil || len(snapshot.Worker) == 0 {
 		// The log format is the runner's, undocumented, and can change on upgrade. Curating by content
-		// alone is what a step does, so this costs the report its SHA and source columns, nothing more.
+		// alone is what a step does, so every action is still decided - by content rather than by SHA.
 		log.Warn(fmt.Sprintf("Cannot read the actions this job resolved from the runner's logs in %q - curating the action cache "+
 			"without runner SHAs: %v", d.runnerDir, errors.Join(diagErr, errNoLoggedActions(len(snapshot.Worker)))))
 		return walked, nil

@@ -318,6 +318,45 @@ func TestArtifactoryDeciderRejects(t *testing.T) {
 	})
 }
 
+func TestArtifactoryDeciderRejectsNamingOnlyARequestedCommit(t *testing.T) {
+	const reason = "Package is blocked by policy: no-unpinned-actions"
+	tests := []struct {
+		name      string
+		ref       string
+		wantNotes string
+	}{
+		{
+			name:      "verify when a ref pinned to a commit is blocked then the notes name that commit",
+			ref:       strings.ToUpper(tagCommit),
+			wantNotes: reason + "; " + resolvedSHANotePrefix + tagCommit,
+		},
+		{
+			name:      "verify when a branch colliding with a tag is blocked then the notes name the tip commit requested",
+			ref:       "refs/heads/collision",
+			wantNotes: reason + "; " + resolvedSHANotePrefix + branchTip,
+		},
+		{
+			name:      "verify when a tag is blocked then the notes name no commit, since Artifactory resolved it",
+			ref:       "v4",
+			wantNotes: reason,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeArtifactory{
+				refsStatus: http.StatusOK, refsBody: deciderAdvertisement,
+				downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope),
+			}
+			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: t.TempDir()}
+
+			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+
+			require.NoError(t, err)
+			assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: tt.wantNotes}, got)
+		})
+	}
+}
+
 func TestArtifactoryDeciderErrors(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -413,12 +452,12 @@ func TestArtifactoryDeciderDecidesByTheRunnerSHA(t *testing.T) {
 			"the ref is not looked up: the runner already named the commit")
 		assertNoSpoolLeft(t, tempDir)
 	})
-	t.Run("verify when the runner SHA is known and its commit is blocked then it is rejected", func(t *testing.T) {
+	t.Run("verify when the runner SHA is known and its commit is blocked then it is rejected with that SHA in the notes", func(t *testing.T) {
 		fake := &fakeArtifactory{downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope)}
 		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: t.TempDir(), RunnerSHA: tagCommit}
 		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
 		require.NoError(t, err)
-		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions"}, got)
+		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions; " + resolvedSHANotePrefix + tagCommit}, got)
 		assert.Equal(t, []string{"downloadCommit/github-vcs/actions/checkout/" + tagCommit}, fake.recorded())
 	})
 }
