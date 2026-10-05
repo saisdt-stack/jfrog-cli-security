@@ -33,6 +33,8 @@ type CurationActionsCommand struct {
 	serverDetails    *config.ServerDetails
 	decider          githubactions.ActionCurationDecider
 	vcsRepoResolver  githubactions.ArtifactoryVcsRepoResolver
+	discoverer       actionDiscoverer
+	runnerDir        string
 }
 
 func NewCurationActionsCommand() *CurationActionsCommand {
@@ -102,6 +104,32 @@ func (c *CurationActionsCommand) SetDecider(decider githubactions.ActionCuration
 	return c
 }
 
+// SetActionDiscoverer overrides how the command lists the actions to curate; Run otherwise walks
+// the runner's action cache.
+func (c *CurationActionsCommand) SetActionDiscoverer(d actionDiscoverer) *CurationActionsCommand {
+	c.discoverer = d
+	return c
+}
+
+// SetRunnerDir selects hook mode: the command runs as the self-hosted runner's job-started hook and
+// reads the runner's logs under dir/_diag, in addition to its action cache.
+func (c *CurationActionsCommand) SetRunnerDir(dir string) *CurationActionsCommand {
+	c.runnerDir = dir
+	return c
+}
+
+// discovererFor returns the discoverer Run uses for actionsCacheDir.
+func (c *CurationActionsCommand) discovererFor(actionsCacheDir string) actionDiscoverer {
+	switch {
+	case c.discoverer != nil:
+		return c.discoverer
+	case c.runnerDir != "":
+		return runnerLogDiscoverer{runnerDir: c.runnerDir, actionsCacheDir: actionsCacheDir}
+	default:
+		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir}
+	}
+}
+
 func (c *CurationActionsCommand) CommandName() string {
 	return "curate_gh_actions"
 }
@@ -130,21 +158,19 @@ func (c *CurationActionsCommand) Run() (err error) {
 		}
 	}
 
-	scan, err := githubactions.DiscoverActionCache(actionsCacheDir)
+	discovered, err := c.discovererFor(actionsCacheDir).Discover()
 	if err != nil {
 		return err
-	}
-	if err = scan.UnaccountedError(); err != nil {
-		return err
-	}
-	discovered := scan.Refs
-	if len(discovered) == 0 {
-		return githubactions.ErrCacheNotReadable()
 	}
 
-	used, attributed, err := c.parseWorkflowUses(workingDir)
-	if err != nil {
-		return err
+	var used githubactions.JobUses
+	attributed := false
+	// In hook mode the job has not checked anything out yet, so a workflow file in the workspace is
+	// a previous run's: attributing from it could name the wrong parents and hide local actions.
+	if c.runnerDir == "" {
+		if used, attributed, err = c.parseWorkflowUses(workingDir); err != nil {
+			return err
+		}
 	}
 	var localUses []githubactions.LocalUse
 	if attributed {
@@ -190,7 +216,11 @@ func notApprovedError(rows []githubactions.ActionReportRow) error {
 		if msg.Len() == 0 {
 			msg.WriteString("curation policy did not approve every GitHub Action this job resolved:")
 		}
-		fmt.Fprintf(&msg, "\n  %s@%s: status %q", row.Action, row.Ref, row.Status)
+		fmt.Fprintf(&msg, "\n  %s@%s", row.Action, row.Ref)
+		if row.RunnerSHA != "" {
+			fmt.Fprintf(&msg, " (runner SHA %s)", row.RunnerSHA)
+		}
+		fmt.Fprintf(&msg, ": status %q", row.Status)
 		if row.Notes != "" {
 			fmt.Fprintf(&msg, " - %s", row.Notes)
 		}

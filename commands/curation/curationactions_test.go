@@ -1288,3 +1288,11 @@ func TestCurationActionsCommand_Run_ContentMismatchIsReportedAndFailsTheGate(t *
 	assert.NotContains(t, err.Error(), "acme/three", "an approved action must not be named by the gate")
 	assert.Equal(t, before, snapshotTree(t, actionsCacheDir), "the runner's action cache was modified")
 }
+
+func TestNotApprovedErrorNamesTheRunnerSHA(t *testing.T) {
+	err := notApprovedError([]githubactions.ActionReportRow{
+		{Action: "actions/checkout", Ref: "v3", RunnerSHA: "a37ce912", Status: "Rejected", Notes: "blocked"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "actions/checkout@v3 (runner SHA a37ce912): status \"Rejected\" - blocked")
+}

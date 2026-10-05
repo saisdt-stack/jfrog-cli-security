@@ -461,19 +461,38 @@ func GenerateActionsCurationSectionMarkdown(actionsData []formats.ResultsSummary
 			break
 		}
 	}
-	if withParent {
-		markdown += "\n\n| Action | Ref | Parent | Status | Notes |\n|--------|-----|--------|--------|-------|"
-	} else {
-		markdown += "\n\n| Action | Ref | Status | Notes |\n|--------|-----|--------|-------|"
-	}
+	withProvenance := false
 	for _, actions := range curated {
 		for _, action := range actions.Actions {
-			cell := formats.EscapeMarkdownTableCell
-			if withParent {
-				markdown += fmt.Sprintf("\n| %s | %s | %s | %s | %s |", cell(action.Action), cell(action.Ref), cell(action.Parent), cell(action.Status), cell(action.Notes))
-				continue
+			if action.RunnerSHA != "" || action.Source != "" {
+				withProvenance = true
 			}
-			markdown += fmt.Sprintf("\n| %s | %s | %s | %s |", cell(action.Action), cell(action.Ref), cell(action.Status), cell(action.Notes))
+		}
+	}
+	headers := []string{"Action", "Ref"}
+	if withProvenance {
+		headers = append(headers, "Runner SHA", "Source")
+	}
+	if withParent {
+		headers = append(headers, "Parent")
+	}
+	headers = append(headers, "Status", "Notes")
+	markdown += "\n\n| " + strings.Join(headers, " | ") + " |\n|"
+	for _, header := range headers {
+		markdown += strings.Repeat("-", len(header)+2) + "|"
+	}
+	cell := formats.EscapeMarkdownTableCell
+	for _, actions := range curated {
+		for _, action := range actions.Actions {
+			cells := []string{cell(action.Action), cell(action.Ref)}
+			if withProvenance {
+				cells = append(cells, cell(action.RunnerSHA), cell(action.Source))
+			}
+			if withParent {
+				cells = append(cells, cell(action.Parent))
+			}
+			cells = append(cells, cell(action.Status), cell(action.Notes))
+			markdown += "\n| " + strings.Join(cells, " | ") + " |"
 		}
 	}
 	markdown += formats.RenderActionsException(curated)

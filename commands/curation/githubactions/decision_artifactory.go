@@ -44,7 +44,8 @@ func NewArtifactoryActionCurationDecider(serverDetails *config.ServerDetails) (A
 // runner holds the approved version: Approved when they are identical, Rejected with
 // contentMismatchNote when they are not - the runner and Artifactory resolved a moving tag or branch
 // to different commits. A curation block is Rejected with Artifactory's reason. A mismatch is a
-// verdict, not an error, so the other actions are still decided.
+// verdict, not an error, so the other actions are still decided. When the runner's own logs name the
+// commit (hook mode), decideRunnerCommit decides that commit instead and nothing is compared.
 //
 // Owner and Repo are matched case-insensitively. The ref is case-sensitive; only a full object ID
 // is lower-cased.
@@ -53,6 +54,9 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 		return ActionCurationResult{}, err
 	}
 	owner, repo := strings.ToLower(ref.Owner), strings.ToLower(ref.Repo)
+	if ref.RunnerSHA != "" {
+		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.RunnerSHA)
+	}
 
 	var adv *RefAdvertisement
 	if NeedsRefs(ref.Ref) {
@@ -101,6 +105,26 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 		result.Notes = resolvedSHANotePrefix + sha
 	}
 	return result, nil
+}
+
+// decideRunnerCommit decides the exact commit the runner's logs say it fetched, so no ref is looked
+// up and the runner's copy is not compared: the commit identifies the content, and the runner's
+// action cache is the admin's, trusted to hold what its SHA names.
+//
+// Because the request names the commit, Artifactory's curation audit records this action by its SHA,
+// not by the tag or branch the workflow wrote.
+func (d *artifactoryActionCurationDecider) decideRunnerCommit(artifactoryVcsRepo, owner, repo, sha string) (ActionCurationResult, error) {
+	resolved := ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(sha)}
+	body, _, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
+	var blocked *BlockedError
+	if errors.As(err, &blocked) {
+		return ActionCurationResult{Status: ActionRejected, Notes: blocked.Reason}, nil
+	}
+	if err != nil {
+		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
+	}
+	closeResponseBody(body)
+	return ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + resolved.APIRef}, nil
 }
 
 // spoolArchive saves body to a temp file and closes both, returning the file's path.

@@ -159,3 +159,41 @@ func TestRenderReportTable_CellsThatWouldReshapeTheTableAreEscaped(t *testing.T)
 	assert.NotContains(t, got, "<br>", "markdown markup must not reach the console report")
 	assert.NotContains(t, got, "\nCVE-2024-0001", "a newline in Notes must never end the row early")
 }
+
+func TestRenderReportTableProvenanceColumns(t *testing.T) {
+	plain := []ActionReportRow{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}
+	withSHA := []ActionReportRow{{Action: "actions/checkout", Ref: "v4", RunnerSHA: "11d5960a326750d5838078e36cf38b85af677262", Source: "Downloaded", Status: "Approved"}}
+	tests := []struct {
+		name       string
+		rows       []ActionReportRow
+		withParent bool
+		want       string
+	}{
+		{
+			name: "verify when no row has provenance then the table is unchanged", rows: plain,
+			want: "| Action | Ref | Status | Notes |\n|--------|-----|--------|-------|\n| actions/checkout | v4 | Approved |  |\n",
+		},
+		{
+			name: "verify when a row has provenance then runner SHA and source columns follow Ref", rows: withSHA,
+			want: "| Action | Ref | Runner SHA | Source | Status | Notes |\n|--------|-----|------------|--------|--------|-------|\n" +
+				"| actions/checkout | v4 | 11d5960a326750d5838078e36cf38b85af677262 | Downloaded | Approved |  |\n",
+		},
+		{
+			name: "verify when provenance and parent are both shown then parent follows source", rows: withSHA, withParent: true,
+			want: "| Action | Ref | Runner SHA | Source | Parent | Status | Notes |\n|--------|-----|------------|--------|--------|--------|-------|\n" +
+				"| actions/checkout | v4 | 11d5960a326750d5838078e36cf38b85af677262 | Downloaded |  | Approved |  |\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, RenderReportTable(tt.rows, tt.withParent))
+		})
+	}
+}
+
+func TestNewActionReportRowCarriesProvenance(t *testing.T) {
+	row := NewActionReportRow(ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", RunnerSHA: "abc", Source: SourceCacheArchive},
+		ActionCurationResult{Status: ActionApproved})
+	assert.Equal(t, "abc", row.RunnerSHA)
+	assert.Equal(t, "Cache (archive)", row.Source)
+}

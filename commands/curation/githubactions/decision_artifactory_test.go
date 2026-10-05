@@ -399,3 +399,26 @@ func TestArtifactoryDeciderHonoursCancelledContext(t *testing.T) {
 		assert.Empty(t, fake.recorded())
 	})
 }
+
+func TestArtifactoryDeciderDecidesByTheRunnerSHA(t *testing.T) {
+	t.Run("verify when the runner SHA is known then its commit is downloaded and the runner copy is not compared", func(t *testing.T) {
+		notTheApprovedContent := t.TempDir()
+		tempDir := isolateTempDir(t)
+		fake := approvingArtifactory(t, "")
+		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: notTheApprovedContent, RunnerSHA: tagCommit}
+		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+		require.NoError(t, err)
+		assert.Equal(t, ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + tagCommit}, got)
+		assert.Equal(t, []string{"downloadCommit/github-vcs/actions/checkout/" + tagCommit}, fake.recorded(),
+			"the ref is not looked up: the runner already named the commit")
+		assertNoSpoolLeft(t, tempDir)
+	})
+	t.Run("verify when the runner SHA is known and its commit is blocked then it is rejected", func(t *testing.T) {
+		fake := &fakeArtifactory{downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope)}
+		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: t.TempDir(), RunnerSHA: tagCommit}
+		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+		require.NoError(t, err)
+		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions"}, got)
+		assert.Equal(t, []string{"downloadCommit/github-vcs/actions/checkout/" + tagCommit}, fake.recorded())
+	})
+}

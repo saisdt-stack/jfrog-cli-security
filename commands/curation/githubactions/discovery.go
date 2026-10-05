@@ -47,6 +47,11 @@ type ActionRef struct {
 	Subpaths []string
 	// Parent is the composite action that pulled this one in, "" when unattributed.
 	Parent string
+	// RunnerSHA is the commit the runner fetched for this action, when the runner's logs name it;
+	// "" when they do not, which is always the case for a step on a GitHub-hosted runner.
+	RunnerSHA string
+	// Source is how the runner materialized this action, when its logs say; SourceUnknown otherwise.
+	Source ActionSource
 }
 
 // UnaccountedEntry is a cache entry that exists but could not be resolved to an action.
