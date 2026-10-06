@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,7 +117,6 @@ func TestRunnerLogDiscoverer(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, refs, 1)
 		assert.Equal(t, testShaV4, refs[0].RunnerSHA)
-		assert.Equal(t, githubactions.SourceDownloaded, refs[0].Source)
 	})
 	t.Run("verify when the logs name nothing then it falls back to the cache walk", func(t *testing.T) {
 		runnerDir, cacheDir := hookRunner(t, map[string]string{"Worker_20261005-050652-utc.log": start},
@@ -217,11 +217,11 @@ func TestRunnerLogDiscovererSetupLineCoverage(t *testing.T) {
 		require.NoError(t, err)
 		got := map[string]string{}
 		for _, r := range refs {
-			got[r.Owner+"/"+r.Repo+"@"+r.Ref] = r.RunnerSHA + " " + string(r.Source)
+			got[r.Owner+"/"+r.Repo+"@"+r.Ref] = r.RunnerSHA
 		}
 		assert.Equal(t, map[string]string{
-			"actions/checkout@v4": testShaV4 + " Downloaded",
-			"actions/checkout@v3": testShaV3 + " Downloaded",
+			"actions/checkout@v4": testShaV4,
+			"actions/checkout@v3": testShaV3,
 		}, got)
 	})
 	t.Run("verify when the setup lines cover only some fetched actions then the cache walk recovers the rest", func(t *testing.T) {
@@ -236,5 +236,43 @@ func TestRunnerLogDiscovererSetupLineCoverage(t *testing.T) {
 			got[r.Ref] = r.RunnerSHA
 		}
 		assert.Equal(t, map[string]string{"v4": testShaV4, "v3": testShaV3}, got)
+	})
+}
+
+func TestCurationActionsCommand_Run_StepSummary(t *testing.T) {
+	logs := map[string]string{
+		"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
+		"Worker_20261005-050652-utc.log": "[x INFO Worker] Version: 2.337.0\nSave archive 'https://codeload.github.com/actions/checkout/tar.gz/" + testShaV4 + "' into x\n",
+	}
+	// stepSummary is the file the runner hands the hook, already holding what an earlier hook wrote.
+	stepSummary := func(t *testing.T) string {
+		path := filepath.Join(t.TempDir(), "step_summary.md")
+		require.NoError(t, os.WriteFile(path, []byte("earlier hook\n"), 0o644))
+		t.Setenv(stepSummaryEnvVar, path)
+		return path
+	}
+	t.Run("verify when run as the hook then the report is appended to the runner's step summary", func(t *testing.T) {
+		pinRunnerEnv(t, "octo/repo", "", "")
+		path := stepSummary(t)
+		runnerDir, cacheDir := hookRunner(t, logs, []string{"actions/checkout/v4"})
+		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetRunnerDir(runnerDir).SetDecider(&scriptedDecider{})
+		_, err := captureReport(t, cmd)
+		require.NoError(t, err)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.True(t, strings.HasPrefix(string(content), "earlier hook\n"), "the summary must be appended, not replace what is there")
+		assert.Contains(t, string(content), "GitHub Actions Curation")
+		assert.Contains(t, string(content), "| actions/checkout | v4 |")
+	})
+	t.Run("verify when run as a step then the step summary is left to setup-jfrog-cli", func(t *testing.T) {
+		pinRunnerEnv(t, "octo/repo", "", "")
+		path := stepSummary(t)
+		_, cacheDir := hookRunner(t, logs, []string{"actions/checkout/v4"})
+		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{})
+		_, err := captureReport(t, cmd)
+		require.NoError(t, err)
+		content, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, "earlier hook\n", string(content))
 	})
 }

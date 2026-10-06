@@ -13,7 +13,7 @@ import (
 
 // actionDiscoverer lists the actions this job resolved, in the order the report shows them. A step
 // on a GitHub-hosted runner can only walk the action cache; the job-started hook on a self-hosted
-// runner can also read the runner's own logs, which name the SHA and cache source of each action.
+// runner can also read the runner's own logs, which name the SHA of each action.
 type actionDiscoverer interface {
 	Discover() ([]githubactions.ActionRef, error)
 }
@@ -38,8 +38,7 @@ func (d cacheWalkDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 }
 
 // runnerLogDiscoverer lists the actions for the job-started hook on a self-hosted runner from what
-// only the runner's own logs know: the SHA it fetched for each action and whether it came from the
-// network or the runner's action cache. It walks the action cache only when the "Set up job" lines
+// only the runner's own logs know: the SHA it fetched for each action. It walks the action cache only when the "Set up job" lines
 // cannot account for every action, to recover the missing refs.
 type runnerLogDiscoverer struct {
 	runnerDir       string

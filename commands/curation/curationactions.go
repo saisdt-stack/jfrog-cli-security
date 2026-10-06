@@ -470,5 +470,37 @@ func curatedActions(rows []githubactions.ActionReportRow, attributed bool, local
 
 // recordSummary records the report through the "security" job-summary manager
 func (c *CurationActionsCommand) recordSummary(curated formats.CuratedActions) error {
-	return output.RecordSecurityCommandSummary(output.NewCurationActionsSummary(curated))
+	if c.runnerDir == "" {
+		return output.RecordSecurityCommandSummary(output.NewCurationActionsSummary(curated))
+	}
+	return appendStepSummary(curated)
+}
+
+// stepSummaryEnvVar names the file whose markdown the runner shows on the run's summary page.
+const stepSummaryEnvVar = "GITHUB_STEP_SUMMARY"
+
+// appendStepSummary writes the report to the job's summary page in hook mode. A step's recorded
+// summary is rendered by setup-jfrog-cli's post-job step, which a hook runs before; but the runner
+// gives the hook a step summary file of its own and attaches it to the job as it does a step's
+// (JobHookProvider.RunHook, CreateStepSummaryCommand). Outside a runner the variable is unset and
+// nothing is written.
+func appendStepSummary(curated formats.CuratedActions) (err error) {
+	path := os.Getenv(stepSummaryEnvVar)
+	if path == "" {
+		return nil
+	}
+	markdown, err := output.GenerateActionsCurationSectionMarkdown([]formats.ResultsSummary{output.NewCurationActionsSummary(curated).Summary})
+	if err != nil {
+		return err
+	}
+	// #nosec G302 G304 G703 -- the runner names this file for this job and reads it back; it holds the report, not a secret
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	defer func() {
+		err = errors.Join(err, errorutils.CheckError(file.Close()))
+	}()
+	_, err = file.WriteString(markdown + "\n")
+	return errorutils.CheckError(err)
 }

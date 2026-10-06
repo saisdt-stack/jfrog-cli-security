@@ -45,7 +45,7 @@ func buildCache(t *testing.T, entries []cacheEntry) []ActionRef {
 func TestAttachRunnerProvenance(t *testing.T) {
 	t0 := time.Date(2026, 10, 5, 4, 48, 0, 0, time.UTC)
 	dl := func(sha string) WorkerAction {
-		return WorkerAction{Owner: "actions", Repo: "checkout", SHA: sha, Source: SourceDownloaded}
+		return WorkerAction{Owner: "actions", Repo: "checkout", SHA: sha}
 	}
 	tests := []struct {
 		name         string
@@ -84,7 +84,7 @@ func TestAttachRunnerProvenance(t *testing.T) {
 		{
 			name:     "verify when a ref is a symlink into the cache then its target names the SHA",
 			entries:  []cacheEntry{{ref: "v4", linkSHA: shaV4}, {ref: "v3", completed: t0}},
-			worker:   []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCacheSymlink}, dl(shaV3)},
+			worker:   []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}, dl(shaV3)},
 			wantSHAs: map[string]string{"v4": shaV4, "v3": shaV3},
 		},
 		{
@@ -115,9 +115,6 @@ func TestAttachRunnerProvenance(t *testing.T) {
 			got := map[string]string{}
 			for _, r := range refs {
 				got[r.Ref] = r.RunnerSHA
-				if r.RunnerSHA != "" {
-					assert.NotEqual(t, SourceUnknown, r.Source, "a placed ref carries its source")
-				}
 			}
 			assert.Equal(t, tt.wantSHAs, got)
 			assert.Len(t, unplaced, tt.wantUnplaced)
@@ -128,8 +125,8 @@ func TestAttachRunnerProvenance(t *testing.T) {
 func TestAttachRunnerProvenanceReportsActionsMissingFromTheCache(t *testing.T) {
 	refs := buildCache(t, []cacheEntry{{ref: "v4", completed: time.Now()}})
 	worker := []WorkerAction{
-		{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceDownloaded},
-		{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceDownloaded},
+		{Owner: "actions", Repo: "checkout", SHA: shaV4},
+		{Owner: "actions", Repo: "setup-node", SHA: shaNode},
 	}
 	_, unplaced := AttachRunnerProvenance(refs, nil, worker)
 	assert.Equal(t, []WorkerAction{worker[1]}, unplaced)
@@ -140,9 +137,8 @@ func TestAttachRunnerProvenanceMatchesARenamedRepositoryBySHA(t *testing.T) {
 	// the Worker log by the name GitHub resolved it to, which differs after a repository transfer.
 	walked := []ActionRef{{Owner: "oldowner", Repo: "tool", Ref: "v1", Path: filepath.Join(t.TempDir(), "v1")}}
 	setupJob := []LoggedAction{{Owner: "oldowner", Repo: "tool", Ref: "v1", SHA: shaV4}}
-	worker := []WorkerAction{{Owner: "newowner", Repo: "tool", SHA: shaV4, Source: SourceDownloaded}}
+	worker := []WorkerAction{{Owner: "newowner", Repo: "tool", SHA: shaV4}}
 	refs, unplaced := AttachRunnerProvenance(walked, setupJob, worker)
 	assert.Equal(t, shaV4, refs[0].RunnerSHA)
-	assert.Equal(t, SourceDownloaded, refs[0].Source)
 	assert.Empty(t, unplaced)
 }

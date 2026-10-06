@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -17,11 +18,10 @@ import (
 const (
 	// HookEnvVar is the runner setting that names the job-started hook. The runner reads it from
 	// <runner>/.env at start, so a change takes effect when the runner service restarts.
-	HookEnvVar       = "ACTIONS_RUNNER_HOOK_JOB_STARTED"
-	hookFolder       = ".jfrog"
-	previousHookFile = "previous-job-started-hook"
-	scriptHeader     = "# Written by 'jf curate-gh-actions --install-runner-hook'. Re-run that command instead of editing this file.\n"
-	utf8BOM          = "\ufeff"
+	HookEnvVar   = "ACTIONS_RUNNER_HOOK_JOB_STARTED"
+	hookFolder   = ".jfrog"
+	scriptHeader = "# Written by 'jf curate-gh-actions --install-runner-hook'. Re-run that command instead of editing this file.\n"
+	utf8BOM      = "\ufeff"
 )
 
 // InstallOptions are pinned into the hook script, because the runner service usually runs as a
@@ -31,10 +31,14 @@ type InstallOptions struct {
 	JfPath       string // absolute path of the jf binary the hook runs
 	JfrogHomeDir string // the admin's JFROG_CLI_HOME_DIR, holding the server configuration
 	ServerID     string // "" to use that configuration's default server
+	Threads      int    // how many actions the hook decides at once; 0 leaves it to the command's default
 }
 
 // Install writes the hook script and points the runner's .env at it. It returns warnings for
 // settings that would let a job running on this runner tamper with the check, or keep it from running.
+//
+// The runner runs a single job-started hook. When another one is already set, Install writes the
+// script but leaves the setting alone, and fails until that hook calls the script - see callLine.
 func Install(opts InstallOptions) (warnings []string, err error) {
 	// The runner starts the hook from the job's working directory, not the admin's, so every path
 	// written into .env or the script must be absolute.
@@ -49,47 +53,82 @@ func Install(opts InstallOptions) (warnings []string, err error) {
 	}
 	folder := filepath.Join(opts.RunnerDir, hookFolder)
 	envPath := filepath.Join(opts.RunnerDir, ".env")
-	lines, previous, err := readEnv(envPath)
+	lines, inEnvFile, err := readEnv(envPath)
 	if err != nil {
 		return nil, err
 	}
+	current := currentHook(envPath, inEnvFile)
 	script := filepath.Join(folder, flavor.scriptName)
-	if samePath(previous, script) {
-		// Already installed: keep whatever was chained before the first install.
-		if previous, err = readPreviousHook(folder); err != nil {
-			return nil, err
-		}
-		if samePath(previous, script) {
-			// Left by an install that took our own script for another hook; chaining it would recurse.
-			previous = ""
-		}
-	}
 	// Checked before anything is written, so a refusal leaves the runner as it was.
 	if err = checkHookPath(runtime.GOOS, script); err != nil {
 		return nil, err
 	}
-	if err = checkChainable(previous); err != nil {
-		return nil, err
+	adminHook := current.path != "" && !samePath(current.path, script)
+	calledByAdminHook := false
+	if adminHook {
+		if calledByAdminHook, err = hookCalls(runtime.GOOS, current.path, script); err != nil {
+			return nil, errorutils.CheckErrorf("the runner's job-started hook cannot be read, so nothing was installed.\n\n"+
+				"%s sets %s to:\n  %s\nbut reading it failed: %v\n\n"+
+				"To continue, either:\n"+
+				"  - fix that path so it names your hook, or\n"+
+				"  - %s, if the runner should not run that hook,\n"+
+				"then run this command again.",
+				current.setBy, HookEnvVar, current.path, err, current.unset)
+		}
 	}
 	// #nosec G301 G703 -- the runner service, often another user, must read and run what is in here; the
 	// runner directory comes from the admin running install, not from a job
 	if err = os.MkdirAll(folder, 0o755); err != nil {
 		return nil, errorutils.CheckError(err)
 	}
-	if previous != "" {
-		// #nosec G306 G703 -- holds a path, not a secret; read back by uninstall
-		if err = os.WriteFile(filepath.Join(folder, previousHookFile), []byte(previous), 0o644); err != nil {
-			return nil, errorutils.CheckError(err)
-		}
-	}
 	// #nosec G306 -- the runner service, often another user, must read and run the hook script
-	if err = os.WriteFile(script, []byte(flavor.render(opts, previous)), 0o755); err != nil {
+	if err = os.WriteFile(script, []byte(flavor.render(opts)), 0o755); err != nil {
 		return nil, errorutils.CheckError(err)
 	}
-	if err = writeEnv(envPath, lines, script); err != nil {
-		return nil, err
+	warnings = tamperWarnings(runtime.GOOS, opts, folder, script)
+	if !adminHook {
+		if err = writeEnv(envPath, lines, script); err != nil {
+			return nil, err
+		}
+		if current.path == "" {
+			warnings = append(warnings, fmt.Sprintf("%s now sets %s. If the runner service also sets it in its own environment "+
+				"(a systemd unit, a container image or a pod spec), the runner uses the .env value and that hook stops running. "+
+				"In that case remove the line from %s and add this as the first command of that hook instead:\n%s",
+				envPath, HookEnvVar, envPath, callLine(flavor.scriptName, script)))
+		}
+	} else if !calledByAdminHook {
+		return nil, errorutils.CheckErrorf("one more step is needed: the runner already has a job-started hook, so the curation check is not active yet.\n\n"+
+			"A runner runs only one job-started hook, and %s sets it to:\n  %s\n"+
+			"This command did not change that. It wrote the curation check to:\n  %s\n"+
+			"and your hook has to call it.\n\n"+
+			"To finish the install:\n"+
+			"  1. Add this line to %s, as its first command:\n       %s\n"+
+			"     It must run before anything else in the hook: the runner deletes the logs the check reads a few seconds after a job starts.\n"+
+			"  2. Run this command again. It confirms that your hook calls the check.\n\n"+
+			"Or, to run only the curation check, %s and run this command again.",
+			current.setBy, current.path, script, current.path, callLine(current.path, script), current.unset)
 	}
-	return tamperWarnings(runtime.GOOS, opts, folder, script), nil
+	return warnings, nil
+}
+
+// hookSetting is the runner's job-started hook, and where it is set, for telling the admin how to change it.
+type hookSetting struct {
+	path  string // "" when none is set
+	setBy string
+	unset string
+}
+
+// currentHook is the hook .env sets or, when it sets none, the one this process's environment sets:
+// in an image build that is the environment the runner will start with. A hook set only in the runner
+// service's own environment cannot be seen from here.
+func currentHook(envPath, inEnvFile string) hookSetting {
+	if inEnvFile == "" {
+		if fromEnv := os.Getenv(HookEnvVar); fromEnv != "" {
+			return hookSetting{path: fromEnv, setBy: "the " + HookEnvVar + " environment variable",
+				unset: "unset " + HookEnvVar + " where it is set (for example the image's ENV)"}
+		}
+	}
+	return hookSetting{path: inEnvFile, setBy: envPath, unset: "remove the " + HookEnvVar + " line from " + envPath}
 }
 
 // tamperWarnings names what would let a job on this runner change what the hook runs. Off Windows
@@ -116,37 +155,83 @@ func tamperWarnings(goos string, opts InstallOptions, folder, script string) []s
 	return warnings
 }
 
-// Uninstall restores the hook that was configured before Install, or removes the setting.
+// Uninstall removes the hook script, and the .env setting when it names the script. It refuses while
+// another hook still calls the script, since that hook would then fail every job.
 func Uninstall(runnerDir string) error {
 	folder := filepath.Join(runnerDir, hookFolder)
 	envPath := filepath.Join(runnerDir, ".env")
-	lines, _, err := readEnv(envPath)
+	lines, inEnvFile, err := readEnv(envPath)
 	if err != nil {
 		return err
 	}
-	previous, err := readPreviousHook(folder)
-	if err != nil {
-		return err
+	current := currentHook(envPath, inEnvFile)
+	script := filepath.Join(folder, flavorFor(runtime.GOOS).scriptName)
+	if current.path == "" || samePath(current.path, script) {
+		if err = writeEnv(envPath, lines, ""); err != nil {
+			return err
+		}
+		return errorutils.CheckError(os.RemoveAll(folder))
 	}
-	if err = writeEnv(envPath, lines, previous); err != nil {
-		return err
+	called, err := hookCalls(runtime.GOOS, current.path, script)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errorutils.CheckError(fmt.Errorf("reading the runner's job-started hook '%s': %w", current.path, err))
+	}
+	if called {
+		return errorutils.CheckErrorf("the curation check was not removed, because the runner's job-started hook still calls it.\n\n"+
+			"%s sets the hook to:\n  %s\nwhich calls:\n  %s\n"+
+			"Removing the check first would make that hook, and so every job on this runner, fail.\n\n"+
+			"To uninstall:\n"+
+			"  1. Remove the line that calls %s from %s.\n"+
+			"  2. Run this command again.",
+			current.setBy, current.path, script, script, current.path)
 	}
 	return errorutils.CheckError(os.RemoveAll(folder))
 }
 
-// readPreviousHook returns the hook that was set before the first install, or "" when there was none.
-// Any error other than the file being absent is returned: taking it for "none" would drop the admin's
-// hook from the chain on re-install, and from .env on uninstall.
-func readPreviousHook(folder string) (string, error) {
-	content, err := os.ReadFile(filepath.Join(folder, previousHookFile))
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
+// hookCalls reports whether the admin's hook already runs script, so that re-installing does not ask
+// for the call again.
+func hookCalls(goos, hook, script string) (bool, error) {
+	content, err := os.ReadFile(hook)
 	if err != nil {
-		return "", errorutils.CheckError(fmt.Errorf("reading the hook that ran before curate-gh-actions was installed: %w", err))
+		return false, err
 	}
-	return string(content), nil
+	text := pathText(goos, string(content))
+	return strings.Contains(text, pathText(goos, script)) || strings.Contains(text, pathText(goos, callLine(hook, script))), nil
 }
+
+// pathText is s as hookCalls compares it: an admin may type the script's path in another letter case
+// on Windows and macOS, whose file systems ignore it by default, and with forward slashes on Windows.
+func pathText(goos, s string) string {
+	switch goos {
+	case "windows":
+		return strings.ToLower(strings.ReplaceAll(s, "/", `\`))
+	case "darwin":
+		return strings.ToLower(s)
+	}
+	return s
+}
+
+// callLine is the line that runs script from the admin's hook and stops that hook when the check
+// fails. The runner runs a .sh hook with 'bash -e', which stops on a failed command by itself, but
+// dot-sources a .ps1 hook with no exit-code handling, so there the line checks the result itself.
+// A .ps1 script is only written on Windows, which always has Windows PowerShell but not always pwsh.
+func callLine(hook, script string) string {
+	if filepath.Ext(hook) == ".ps1" {
+		call := "& " + powerShellQuote(script)
+		if filepath.Ext(script) == ".sh" {
+			call = "& bash -e " + powerShellQuote(script)
+		}
+		return call + "; " + hookCallFailed
+	}
+	if filepath.Ext(script) == ".ps1" {
+		return "powershell -command " + shellQuote(". "+powerShellQuote(script))
+	}
+	return "bash -e " + shellQuote(script)
+}
+
+// hookCallFailed stops a PowerShell hook when the script it called failed. $LASTEXITCODE reflects only
+// native commands and script exits, so a script that ends in an error leaves $? false with no exit code.
+const hookCallFailed = "if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }"
 
 func checkInstallable(runnerDir string, flavor hookFlavor) error {
 	if os.Getenv("GITHUB_ACTIONS") == "true" {
@@ -162,7 +247,7 @@ func checkInstallable(runnerDir string, flavor hookFlavor) error {
 
 // samePath reports whether a and b name the same file. The runner directory may be given under
 // another spelling than at the last install - another letter case on Windows and macOS, or a symlink -
-// and our own script must never be taken for a hook to chain, or it would run itself on every job.
+// and our own script must not be taken for the admin's hook.
 func samePath(a, b string) bool {
 	if a == b {
 		return true
@@ -221,7 +306,7 @@ func writeEnv(path string, lines []string, hook string) error {
 type hookFlavor struct {
 	scriptName   string
 	configScript string // the runner's configure script, which every runner directory holds
-	render       func(opts InstallOptions, previous string) string
+	render       func(opts InstallOptions) string
 }
 
 func flavorFor(goos string) hookFlavor {
@@ -251,52 +336,25 @@ func checkHookPath(goos, script string) error {
 	return nil
 }
 
-// checkChainable refuses a previous hook that the generated script could not run the way the runner
-// would. The runner matches the extension exactly, so ".SH" is refused here as it would fail there.
-func checkChainable(previous string) error {
-	switch filepath.Ext(previous) {
-	case ".sh", ".ps1":
-		return nil
-	}
-	if previous == "" {
-		return nil
-	}
-	return errorutils.CheckErrorf("the runner's job-started hook '%s' cannot be chained: only .sh and .ps1 hooks can run after "+
-		"curate-gh-actions - remove it from %s in the runner's .env, or call it from a .sh or .ps1 script, then install again",
-		previous, HookEnvVar)
-}
-
-// bashHookScript runs the check first, because the runner's logs it reads are deleted seconds after
-// the hook starts, then any hook that was configured before. The runner runs it with 'bash -e', so a
-// failed check stops here and fails the job.
-func bashHookScript(opts InstallOptions, previous string) string {
+// bashHookScript runs the check. The runner runs it with 'bash -e', so a failed check fails the job.
+func bashHookScript(opts InstallOptions) string {
 	var sb strings.Builder
 	sb.WriteString("#!/bin/bash\n" + scriptHeader)
 	sb.WriteString("export JFROG_CLI_HOME_DIR=" + shellQuote(opts.JfrogHomeDir) + "\n")
 	if opts.ServerID != "" {
 		sb.WriteString("export JFROG_CLI_SERVER_ID=" + shellQuote(opts.ServerID) + "\n")
 	}
-	sb.WriteString(shellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + shellQuote(opts.RunnerDir) + "\n")
-	switch filepath.Ext(previous) {
-	case ".sh":
-		// The runner runs a .sh hook with bash rather than executing it, so the chained hook need not
-		// be executable; run it the same way.
-		sb.WriteString("bash -e " + shellQuote(previous) + "\n")
-	case ".ps1":
-		// The runner dot-sources a .ps1 hook with pwsh; off Windows there is no powershell to fall back to.
-		sb.WriteString("pwsh -command " + shellQuote(". "+powerShellQuote(previous)) + "\n")
-	}
+	sb.WriteString(shellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + shellQuote(opts.RunnerDir) + threadsArg(opts) + "\n")
 	return sb.String()
 }
 
 // powerShellHookScript is the Windows hook. The runner runs it as pwsh -command ". '<path>'" (or
 // powershell) and, unlike a run step, adds no exit-code handling around it, so the script stops on
-// any error - a missing jf must fail the job, not pass it - and exits non-zero itself when jf does.
-// PowerShell then reports any failure as exit code 1, which is all the runner checks. A chained hook
-// gets back the default error handling it was written for. The byte order mark is
-// there because Windows PowerShell 5.1 reads a file without one in the ANSI code page, which would
-// garble a non-ASCII path.
-func powerShellHookScript(opts InstallOptions, previous string) string {
+// any error - a missing jf must fail the job, not pass it - and exits with jf's exit code itself.
+// PowerShell then reports any failure as exit code 1, which is all the runner checks. The byte order
+// mark is there because Windows PowerShell 5.1 reads a file without one in the ANSI code page, which
+// would garble a non-ASCII path.
+func powerShellHookScript(opts InstallOptions) string {
 	var sb strings.Builder
 	sb.WriteString(utf8BOM + scriptHeader)
 	sb.WriteString("$ErrorActionPreference = 'Stop'\n")
@@ -304,22 +362,10 @@ func powerShellHookScript(opts InstallOptions, previous string) string {
 	if opts.ServerID != "" {
 		sb.WriteString("$env:JFROG_CLI_SERVER_ID = " + powerShellQuote(opts.ServerID) + "\n")
 	}
-	sb.WriteString("& " + powerShellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + powerShellQuote(opts.RunnerDir) + "\n")
-	sb.WriteString("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n")
-	switch filepath.Ext(previous) {
-	case ".ps1":
-		sb.WriteString("$ErrorActionPreference = 'Continue'\n& " + powerShellQuote(previous) + "\n" + chainedHookFailed)
-	case ".sh":
-		sb.WriteString("$ErrorActionPreference = 'Continue'\n& bash -e " + powerShellQuote(previous) + "\n" + chainedHookFailed)
-	}
+	sb.WriteString("& " + powerShellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + powerShellQuote(opts.RunnerDir) + threadsArg(opts) + "\n")
 	sb.WriteString("exit $LASTEXITCODE\n")
 	return sb.String()
 }
-
-// chainedHookFailed fails the hook when the chained one did. $LASTEXITCODE reflects only native
-// commands, so a chained .ps1 that is missing or ends in an error would otherwise leave jf's 0 there
-// and pass the job, where the runner running that hook on its own would fail it.
-const chainedHookFailed = "if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }\n"
 
 // powerShellQuotes are the characters PowerShell takes as a single quote: ' and the typographic ‘ ’ ‚ ‛.
 const powerShellQuotes = "'\u2018\u2019\u201a\u201b"
@@ -330,6 +376,14 @@ var powerShellQuoteEscaper = strings.NewReplacer("'", "''", "\u2018", "\u2018\u2
 // powerShellQuote returns s as a PowerShell single-quoted string, in which nothing is expanded.
 func powerShellQuote(s string) string {
 	return "'" + powerShellQuoteEscaper.Replace(s) + "'"
+}
+
+// threadsArg is the --threads the hook passes to jf, or "" so that jf's own default applies.
+func threadsArg(opts InstallOptions) string {
+	if opts.Threads <= 0 {
+		return ""
+	}
+	return " --threads " + strconv.Itoa(opts.Threads)
 }
 
 func shellQuote(s string) string {

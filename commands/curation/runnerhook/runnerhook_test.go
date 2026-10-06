@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 func fakeRunner(t *testing.T, env string) string {
 	t.Helper()
 	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv(HookEnvVar, "")
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".runner"), []byte("{}"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, flavorFor(runtime.GOOS).configScript), []byte("rem\n"), 0o755))
@@ -41,24 +43,60 @@ func TestInstall(t *testing.T) {
 		flavor := flavorFor(runtime.GOOS)
 		script := filepath.Join(dir, ".jfrog", flavor.scriptName)
 		assert.Equal(t, "LANG=en_US.UTF-8\n"+HookEnvVar+"="+script+"\n", readFile(t, filepath.Join(dir, ".env")))
-		assert.Equal(t, flavor.render(absOpts(t, opts(dir)), ""), readFile(t, script))
+		assert.Equal(t, flavor.render(absOpts(t, opts(dir))), readFile(t, script))
 	})
-	t.Run("verify when installed twice then the env holds one hook line", func(t *testing.T) {
+	t.Run("verify when installed twice then the env holds one hook line and only the first install warns about a service-set hook", func(t *testing.T) {
 		dir := fakeRunner(t, "")
-		_, err := Install(opts(dir))
+		warnings, err := Install(opts(dir))
 		require.NoError(t, err)
-		_, err = Install(opts(dir))
+		assert.True(t, slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "systemd unit") }),
+			"a hook set in the service's environment is replaced by .env, and install cannot see it: %q", warnings)
+		warnings, err = Install(opts(dir))
 		require.NoError(t, err)
+		assert.False(t, slices.ContainsFunc(warnings, func(w string) bool { return strings.Contains(w, "systemd unit") }), "%q", warnings)
 		assert.Equal(t, HookEnvVar+"="+filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)+"\n", readFile(t, filepath.Join(dir, ".env")))
 	})
-	t.Run("verify when another hook exists then ours runs first and it runs after", func(t *testing.T) {
-		dir := fakeRunner(t, HookEnvVar+"=/opt/other-hook.sh\n")
+	t.Run("verify when the admin's hook does not call ours then install writes the script, leaves .env and says what to add", func(t *testing.T) {
+		dir := fakeRunner(t, "")
+		hook := adminHook(t, "")
+		env := HookEnvVar + "=" + hook + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0o644))
+		_, err := Install(opts(dir))
+		require.Error(t, err)
+		script := filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)
+		assert.Contains(t, err.Error(), callLine(hook, script), "the admin must be told the exact line to add")
+		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")), "the runner runs one hook, so the admin's must stay")
+		assert.FileExists(t, script, "the line the admin is told to add must work as soon as it is added")
+	})
+	t.Run("verify when the admin's hook already calls ours then install succeeds and leaves .env", func(t *testing.T) {
+		dir := fakeRunner(t, "")
+		script := filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)
+		hook := adminHook(t, callLine(hookName(), script)+"\n")
+		env := HookEnvVar + "=" + hook + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0o644))
 		_, err := Install(opts(dir))
 		require.NoError(t, err)
-		content := readFile(t, filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName))
-		assert.Equal(t, flavorFor(runtime.GOOS).render(absOpts(t, opts(dir)), "/opt/other-hook.sh"), content)
-		assert.Less(t, strings.Index(content, "curate-gh-actions --runner-hook"), strings.Index(content, "/opt/other-hook.sh"))
-		assert.Equal(t, "/opt/other-hook.sh", readFile(t, filepath.Join(dir, ".jfrog", previousHookFile)))
+		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
+		assert.Equal(t, flavorFor(runtime.GOOS).render(absOpts(t, opts(dir))), readFile(t, script))
+	})
+	t.Run("verify when only the environment sets the admin's hook then install leaves .env and says what to add", func(t *testing.T) {
+		dir := fakeRunner(t, "")
+		hook := adminHook(t, "")
+		t.Setenv(HookEnvVar, hook)
+		_, err := Install(opts(dir))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "the "+HookEnvVar+" environment variable")
+		assert.Contains(t, err.Error(), callLine(hook, filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)))
+		assert.NoFileExists(t, filepath.Join(dir, ".env"), "a .env hook would replace the one the runner gets from its environment")
+	})
+	t.Run("verify when .env names a hook that does not exist then install refuses and writes nothing", func(t *testing.T) {
+		env := HookEnvVar + "=/opt/no-such-hook.sh\n"
+		dir := fakeRunner(t, env)
+		_, err := Install(opts(dir))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "/opt/no-such-hook.sh")
+		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
+		assert.NoDirExists(t, filepath.Join(dir, ".jfrog"))
 	})
 	t.Run("verify when run inside a GitHub Actions job then it refuses", func(t *testing.T) {
 		dir := fakeRunner(t, "")
@@ -87,21 +125,57 @@ func TestInstall(t *testing.T) {
 }
 
 func TestUninstall(t *testing.T) {
-	t.Run("verify when a previous hook was chained then it is restored", func(t *testing.T) {
-		dir := fakeRunner(t, "A=1\n"+HookEnvVar+"=/opt/other-hook.sh\n")
+	install := func(t *testing.T, dir string) {
+		t.Helper()
 		_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
 		require.NoError(t, err)
-		require.NoError(t, Uninstall(dir))
-		assert.Equal(t, "A=1\n"+HookEnvVar+"=/opt/other-hook.sh\n", readFile(t, filepath.Join(dir, ".env")))
-		assert.NoDirExists(t, filepath.Join(dir, ".jfrog"))
-	})
-	t.Run("verify when no hook was chained then the line is removed", func(t *testing.T) {
+	}
+	t.Run("verify when .env names our hook then the line and the script are removed", func(t *testing.T) {
 		dir := fakeRunner(t, "A=1\n")
-		_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
-		require.NoError(t, err)
+		install(t, dir)
 		require.NoError(t, Uninstall(dir))
 		assert.Equal(t, "A=1\n", readFile(t, filepath.Join(dir, ".env")))
+		assert.NoDirExists(t, filepath.Join(dir, ".jfrog"))
 	})
+	t.Run("verify when the admin's hook still calls ours then uninstall refuses and keeps the script", func(t *testing.T) {
+		dir := fakeRunner(t, "")
+		hook := adminHook(t, callLine(hookName(), filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName))+"\n")
+		env := "A=1\n" + HookEnvVar + "=" + hook + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0o644))
+		install(t, dir)
+		err := Uninstall(dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), hook)
+		assert.DirExists(t, filepath.Join(dir, ".jfrog"), "the admin's hook would fail every job without the script")
+		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
+	})
+	t.Run("verify when the admin's hook no longer calls ours then the script is removed and .env kept", func(t *testing.T) {
+		dir := fakeRunner(t, "")
+		hook := adminHook(t, callLine(hookName(), filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName))+"\n")
+		env := HookEnvVar + "=" + hook + "\n"
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0o644))
+		install(t, dir)
+		require.NoError(t, os.WriteFile(hook, []byte("echo admin\n"), 0o644))
+		require.NoError(t, Uninstall(dir))
+		assert.NoDirExists(t, filepath.Join(dir, ".jfrog"))
+		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
+	})
+}
+
+// hookName is the name of an admin's hook on this OS, for callLine.
+func hookName() string {
+	if runtime.GOOS == "windows" {
+		return "admin-hook.ps1"
+	}
+	return "admin-hook.sh"
+}
+
+// adminHook writes an admin's own job-started hook with content and returns its path.
+func adminHook(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), hookName())
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	return path
 }
 
 func TestInstallMakesPathsAbsolute(t *testing.T) {
@@ -123,16 +197,13 @@ func TestInstallMakesPathsAbsolute(t *testing.T) {
 }
 
 func TestInstallAcceptsCRLFEnv(t *testing.T) {
-	dir := fakeRunner(t, "A=1\r\n"+HookEnvVar+"=/opt/other-hook.sh\r\n")
+	dir := fakeRunner(t, "")
+	script := filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("A=1\r\n"+HookEnvVar+"="+script+"\r\n"), 0o644))
 	_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
-	require.NoError(t, err)
-	assert.Equal(t, "A=1\n"+HookEnvVar+"="+filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)+"\n", readFile(t, filepath.Join(dir, ".env")),
+	require.NoError(t, err, "the hook path must not carry the carriage return, or our own hook is taken for the admin's")
+	assert.Equal(t, "A=1\n"+HookEnvVar+"="+script+"\n", readFile(t, filepath.Join(dir, ".env")),
 		"a CRLF .env must not keep its hook line beside ours")
-	assert.Equal(t, "/opt/other-hook.sh", readFile(t, filepath.Join(dir, ".jfrog", previousHookFile)),
-		"the chained hook path must not carry the carriage return")
-
-	require.NoError(t, Uninstall(dir))
-	assert.Equal(t, "A=1\n"+HookEnvVar+"=/opt/other-hook.sh\n", readFile(t, filepath.Join(dir, ".env")))
 }
 
 func TestHookScripts(t *testing.T) {
@@ -140,36 +211,25 @@ func TestHookScripts(t *testing.T) {
 	unix := InstallOptions{RunnerDir: "/opt/actions-runner", JfPath: "/usr/local/bin/jf", JfrogHomeDir: "/etc/jfrog", ServerID: "prod"}
 	windows := InstallOptions{RunnerDir: `C:\actions-runner`, JfPath: `C:\Program Files\jfrog\jf.exe`, JfrogHomeDir: `C:\Users\admin\.jfrog`, ServerID: "prod"}
 	tests := []struct {
-		name     string
-		render   func(InstallOptions, string) string
-		opts     InstallOptions
-		previous string
-		want     string
+		name   string
+		render func(InstallOptions) string
+		opts   InstallOptions
+		want   string
 	}{
 		{
-			name: "verify when bash has no previous hook and no server then only jf runs", render: bashHookScript,
+			name: "verify when bash has no server then only the home is exported", render: bashHookScript,
 			opts: InstallOptions{RunnerDir: "/r", JfPath: "/jf", JfrogHomeDir: "/h"},
 			want: "#!/bin/bash\n" + header +
 				"export JFROG_CLI_HOME_DIR='/h'\n" +
 				"'/jf' curate-gh-actions --runner-hook --runner-dir '/r'\n",
 		},
 		{
-			name: "verify when bash chains a .sh hook then bash runs it after jf", render: bashHookScript,
-			opts: unix, previous: "/opt/other-hook.sh",
+			name: "verify when bash has a server then it is exported for jf", render: bashHookScript,
+			opts: unix,
 			want: "#!/bin/bash\n" + header +
 				"export JFROG_CLI_HOME_DIR='/etc/jfrog'\n" +
 				"export JFROG_CLI_SERVER_ID='prod'\n" +
-				"'/usr/local/bin/jf' curate-gh-actions --runner-hook --runner-dir '/opt/actions-runner'\n" +
-				"bash -e '/opt/other-hook.sh'\n",
-		},
-		{
-			name: "verify when bash chains a .ps1 hook then pwsh dot-sources it as the runner would", render: bashHookScript,
-			opts: unix, previous: "/opt/hooks/other.ps1",
-			want: "#!/bin/bash\n" + header +
-				"export JFROG_CLI_HOME_DIR='/etc/jfrog'\n" +
-				"export JFROG_CLI_SERVER_ID='prod'\n" +
-				"'/usr/local/bin/jf' curate-gh-actions --runner-hook --runner-dir '/opt/actions-runner'\n" +
-				`pwsh -command '. '\''/opt/hooks/other.ps1'\'''` + "\n",
+				"'/usr/local/bin/jf' curate-gh-actions --runner-hook --runner-dir '/opt/actions-runner'\n",
 		},
 		{
 			name: "verify when bash paths hold an apostrophe then it is escaped", render: bashHookScript,
@@ -179,41 +239,38 @@ func TestHookScripts(t *testing.T) {
 				`'/jf' curate-gh-actions --runner-hook --runner-dir '/home/o'\''brien/runner'` + "\n",
 		},
 		{
-			name: "verify when powershell has no previous hook then it stops on errors and passes jf's exit code on", render: powerShellHookScript,
+			name: "verify when bash pins --threads then the hook passes it to jf", render: bashHookScript,
+			opts: InstallOptions{RunnerDir: "/r", JfPath: "/jf", JfrogHomeDir: "/h", Threads: 8},
+			want: "#!/bin/bash\n" + header +
+				"export JFROG_CLI_HOME_DIR='/h'\n" +
+				"'/jf' curate-gh-actions --runner-hook --runner-dir '/r' --threads 8\n",
+		},
+		{
+			name: "verify when powershell pins --threads then the hook passes it to jf", render: powerShellHookScript,
+			opts: InstallOptions{RunnerDir: `C:\r`, JfPath: `C:\jf.exe`, JfrogHomeDir: `C:\h`, Threads: 8},
+			want: "\ufeff" + header +
+				"$ErrorActionPreference = 'Stop'\n" +
+				`$env:JFROG_CLI_HOME_DIR = 'C:\h'` + "\n" +
+				`& 'C:\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\r' --threads 8` + "\n" +
+				"exit $LASTEXITCODE\n",
+		},
+		{
+			name: "verify when powershell has no server then it stops on errors and passes jf's exit code on", render: powerShellHookScript,
 			opts: InstallOptions{RunnerDir: `C:\r`, JfPath: `C:\jf.exe`, JfrogHomeDir: `C:\h`},
 			want: "\ufeff" + header +
 				"$ErrorActionPreference = 'Stop'\n" +
 				`$env:JFROG_CLI_HOME_DIR = 'C:\h'` + "\n" +
 				`& 'C:\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\r'` + "\n" +
-				"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n" +
 				"exit $LASTEXITCODE\n",
 		},
 		{
-			name: "verify when powershell chains a .ps1 hook then it runs after jf with the runner's default error handling", render: powerShellHookScript,
-			opts: windows, previous: `C:\hooks\other.ps1`,
+			name: "verify when powershell has a server then it is set for jf", render: powerShellHookScript,
+			opts: windows,
 			want: "\ufeff" + header +
 				"$ErrorActionPreference = 'Stop'\n" +
 				`$env:JFROG_CLI_HOME_DIR = 'C:\Users\admin\.jfrog'` + "\n" +
 				"$env:JFROG_CLI_SERVER_ID = 'prod'\n" +
 				`& 'C:\Program Files\jfrog\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\actions-runner'` + "\n" +
-				"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n" +
-				"$ErrorActionPreference = 'Continue'\n" +
-				`& 'C:\hooks\other.ps1'` + "\n" +
-				"if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }\n" +
-				"exit $LASTEXITCODE\n",
-		},
-		{
-			name: "verify when powershell chains a .sh hook then bash runs it after jf", render: powerShellHookScript,
-			opts: windows, previous: `C:\hooks\other.sh`,
-			want: "\ufeff" + header +
-				"$ErrorActionPreference = 'Stop'\n" +
-				`$env:JFROG_CLI_HOME_DIR = 'C:\Users\admin\.jfrog'` + "\n" +
-				"$env:JFROG_CLI_SERVER_ID = 'prod'\n" +
-				`& 'C:\Program Files\jfrog\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\actions-runner'` + "\n" +
-				"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n" +
-				"$ErrorActionPreference = 'Continue'\n" +
-				`& bash -e 'C:\hooks\other.sh'` + "\n" +
-				"if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1 }\n" +
 				"exit $LASTEXITCODE\n",
 		},
 		{
@@ -223,13 +280,12 @@ func TestHookScripts(t *testing.T) {
 				"$ErrorActionPreference = 'Stop'\n" +
 				`$env:JFROG_CLI_HOME_DIR = 'C:\h'` + "\n" +
 				`& 'C:\Users\O’’Brien\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\Users\O''Brien\r'` + "\n" +
-				"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\n" +
 				"exit $LASTEXITCODE\n",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.render(tt.opts, tt.previous))
+			assert.Equal(t, tt.want, tt.render(tt.opts))
 		})
 	}
 }
@@ -251,28 +307,51 @@ func TestFlavorFor(t *testing.T) {
 	}
 }
 
-func TestCheckChainable(t *testing.T) {
+func TestCallLine(t *testing.T) {
 	tests := []struct {
-		name     string
-		previous string
-		wantErr  bool
+		name, hook, script, want string
 	}{
-		{name: "verify when there is no previous hook then nothing is chained", previous: ""},
-		{name: "verify when the previous hook is .sh then it is chained", previous: "/opt/a.sh"},
-		{name: "verify when the previous hook is .ps1 then it is chained", previous: `C:\hooks\a.ps1`},
-		{name: "verify when the previous hook is .js then install refuses", previous: "/opt/a.js", wantErr: true},
-		{name: "verify when the previous hook is .cmd then install refuses", previous: `C:\hooks\a.cmd`, wantErr: true},
-		{name: "verify when the extension differs only in case then install refuses as the runner would", previous: "/opt/a.SH", wantErr: true},
+		{name: "verify when a .sh hook calls the .sh script then bash -e stops it on a failed check", hook: "/opt/a.sh",
+			script: "/r/.jfrog/curate-gh-actions-hook.sh", want: "bash -e '/r/.jfrog/curate-gh-actions-hook.sh'"},
+		{name: "verify when a .ps1 hook calls the .ps1 script then it checks the result itself", hook: `C:\hooks\a.ps1`,
+			script: `C:\r\.jfrog\curate-gh-actions-hook.ps1`, want: `& 'C:\r\.jfrog\curate-gh-actions-hook.ps1'; ` + hookCallFailed},
+		{name: "verify when a .ps1 hook calls the .sh script then it runs it with bash and checks the result", hook: "/opt/a.ps1",
+			script: "/r/.jfrog/curate-gh-actions-hook.sh", want: `& bash -e '/r/.jfrog/curate-gh-actions-hook.sh'; ` + hookCallFailed},
+		{name: "verify when a .sh hook calls the .ps1 script then it runs it with Windows PowerShell, which every Windows has", hook: `C:\hooks\a.sh`,
+			script: `C:\r\.jfrog\curate-gh-actions-hook.ps1`, want: `powershell -command '. '\''C:\r\.jfrog\curate-gh-actions-hook.ps1'\'''`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := checkChainable(tt.previous)
-			if !tt.wantErr {
-				assert.NoError(t, err)
-				return
-			}
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.previous, "the message must name the hook the admin has to deal with")
+			assert.Equal(t, tt.want, callLine(tt.hook, tt.script))
+		})
+	}
+}
+
+func TestHookCalls(t *testing.T) {
+	tests := []struct {
+		name, goos, script, content string
+		want                        bool
+	}{
+		{name: "verify when the hook holds the line install printed then it calls the script", goos: "linux",
+			script: "/r/.jfrog/curate-gh-actions-hook.sh", content: "#!/bin/bash\nbash -e '/r/.jfrog/curate-gh-actions-hook.sh'\n", want: true},
+		{name: "verify when the hook calls the script without the printed quoting then it still calls it", goos: "linux",
+			script: "/r/.jfrog/curate-gh-actions-hook.sh", content: "/r/.jfrog/curate-gh-actions-hook.sh\n", want: true},
+		{name: "verify when the path differs in case on linux then it is another file", goos: "linux",
+			script: "/r/.jfrog/curate-gh-actions-hook.sh", content: "bash -e /R/.jfrog/curate-gh-actions-hook.sh\n"},
+		{name: "verify when the path differs in case on macOS then it is the same file", goos: "darwin",
+			script: "/Users/a/r/.jfrog/curate-gh-actions-hook.sh", content: "bash -e /users/A/R/.jfrog/curate-gh-actions-hook.sh\n", want: true},
+		{name: "verify when the path differs in case and slashes on windows then it is the same file", goos: "windows",
+			script: `C:\Actions-Runner\.jfrog\curate-gh-actions-hook.ps1`, content: "& 'c:/actions-runner/.jfrog/curate-gh-actions-hook.ps1'\n", want: true},
+		{name: "verify when the hook does not mention the script then it does not call it", goos: "windows",
+			script: `C:\r\.jfrog\curate-gh-actions-hook.ps1`, content: "Write-Host prepare\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hook := filepath.Join(t.TempDir(), "admin-hook")
+			require.NoError(t, os.WriteFile(hook, []byte(tt.content), 0o644))
+			got, err := hookCalls(tt.goos, hook, tt.script)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -286,16 +365,6 @@ func absOpts(t *testing.T, opts InstallOptions) InstallOptions {
 		*path = abs
 	}
 	return opts
-}
-
-func TestInstallRefusesAnUnchainableHook(t *testing.T) {
-	env := HookEnvVar + "=/opt/hooks/start.js\n"
-	dir := fakeRunner(t, env)
-	_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "/opt/hooks/start.js")
-	assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")), "a refused install must leave the runner's settings as they were")
-	assert.NoDirExists(t, filepath.Join(dir, ".jfrog"), "a refused install must not leave a half-written hook behind")
 }
 
 func TestTamperWarnings(t *testing.T) {
@@ -378,7 +447,7 @@ func TestInstallRecognizesItsOwnHookUnderAnotherSpelling(t *testing.T) {
 	}
 	flavor := flavorFor(runtime.GOOS)
 
-	t.Run("verify when reinstalled under another spelling then the hook does not chain itself", func(t *testing.T) {
+	t.Run("verify when reinstalled under another spelling then our hook is not taken for the admin's", func(t *testing.T) {
 		dir := fakeRunner(t, "")
 		_, err := Install(opts(dir))
 		require.NoError(t, err)
@@ -386,32 +455,21 @@ func TestInstallRecognizesItsOwnHookUnderAnotherSpelling(t *testing.T) {
 		_, err = Install(opts(other))
 		require.NoError(t, err)
 
-		assert.Equal(t, flavor.render(absOpts(t, opts(other)), ""), readFile(t, filepath.Join(dir, ".jfrog", flavor.scriptName)),
-			"a hook that runs itself would recurse on every job")
-		assert.NoFileExists(t, filepath.Join(dir, ".jfrog", previousHookFile))
+		assert.Equal(t, flavor.render(absOpts(t, opts(other))), readFile(t, filepath.Join(dir, ".jfrog", flavor.scriptName)))
 		require.NoError(t, Uninstall(dir))
 		assert.NotContains(t, readFile(t, filepath.Join(dir, ".env")), HookEnvVar, "uninstall must not leave the runner pointing at a deleted script")
-	})
-	t.Run("verify when the remembered previous hook is our own script then it is dropped", func(t *testing.T) {
-		dir := fakeRunner(t, "")
-		_, err := Install(opts(dir))
-		require.NoError(t, err)
-		script := filepath.Join(dir, ".jfrog", flavor.scriptName)
-		require.NoError(t, os.WriteFile(filepath.Join(dir, ".jfrog", previousHookFile), []byte(respell(t, dir)+script[len(dir):]), 0o644))
-		_, err = Install(opts(dir))
-		require.NoError(t, err)
-		assert.Equal(t, flavor.render(absOpts(t, opts(dir)), ""), readFile(t, script))
 	})
 }
 
 func TestInstallReadsEnvEncodings(t *testing.T) {
 	t.Run("verify when .env starts with a UTF-8 byte order mark then its hook is still found", func(t *testing.T) {
-		dir := fakeRunner(t, "\ufeff"+HookEnvVar+"=/opt/other-hook.sh\nA=1\n")
+		dir := fakeRunner(t, "")
+		script := filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("\ufeff"+HookEnvVar+"="+script+"\nA=1\n"), 0o644))
 		_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
 		require.NoError(t, err)
-		assert.Equal(t, "A=1\n"+HookEnvVar+"="+filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName)+"\n",
-			readFile(t, filepath.Join(dir, ".env")), "the admin's hook must be chained, not left beside ours")
-		assert.Equal(t, "/opt/other-hook.sh", readFile(t, filepath.Join(dir, ".jfrog", previousHookFile)))
+		assert.Equal(t, "A=1\n"+HookEnvVar+"="+script+"\n", readFile(t, filepath.Join(dir, ".env")),
+			"our hook must be recognized, not left beside a second line")
 	})
 	t.Run("verify when .env is UTF-16 then install refuses rather than corrupting it", func(t *testing.T) {
 		utf16 := "\xff\xfeA\x00=\x001\x00\r\x00\n\x00"
@@ -421,35 +479,5 @@ func TestInstallReadsEnvEncodings(t *testing.T) {
 		assert.Contains(t, err.Error(), "UTF-8")
 		assert.Equal(t, utf16, readFile(t, filepath.Join(dir, ".env")))
 		assert.NoDirExists(t, filepath.Join(dir, ".jfrog"))
-	})
-}
-
-func TestPreviousHookFileReadErrors(t *testing.T) {
-	// A previous-hook file that exists but cannot be read - here a directory in its place, which fails
-	// the read on every OS - must not be taken for "nothing was chained", or the admin's hook is lost.
-	installed := func(t *testing.T) string {
-		dir := fakeRunner(t, HookEnvVar+"=/opt/other-hook.sh\n")
-		_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
-		require.NoError(t, err)
-		previous := filepath.Join(dir, ".jfrog", previousHookFile)
-		require.NoError(t, os.Remove(previous))
-		require.NoError(t, os.Mkdir(previous, 0o755))
-		return dir
-	}
-	t.Run("verify when reinstalling cannot read the previous hook then install fails and leaves .env as it was", func(t *testing.T) {
-		dir := installed(t)
-		env := readFile(t, filepath.Join(dir, ".env"))
-		_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/jf", JfrogHomeDir: "/h"})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), previousHookFile)
-		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
-	})
-	t.Run("verify when uninstall cannot read the previous hook then it fails and leaves .env as it was", func(t *testing.T) {
-		dir := installed(t)
-		env := readFile(t, filepath.Join(dir, ".env"))
-		err := Uninstall(dir)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), previousHookFile)
-		assert.Equal(t, env, readFile(t, filepath.Join(dir, ".env")))
 	})
 }

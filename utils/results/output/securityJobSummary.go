@@ -481,7 +481,10 @@ func GenerateActionsCurationSectionMarkdown(actionsData []formats.ResultsSummary
 			markdown += "\n| " + strings.Join(cells, " | ") + " |"
 		}
 	}
-	markdown += formats.RenderActionsException(curated)
+	if caveat := formats.RenderActionsException(curated); caveat != "" {
+		// A markdown table ends only at a blank line; without one the caveat renders as a table row.
+		markdown += "\n" + caveat
+	}
 	markdown = "\n" + DetailsOpenWithSummary.Format("🔒 GitHub Actions Curation", markdown)
 	return
 }

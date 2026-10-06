@@ -34,7 +34,7 @@ func TestReadRunnerDiag(t *testing.T) {
 		snap, err := ReadRunnerDiag(dir)
 		require.NoError(t, err)
 		assert.Equal(t, []LoggedAction{{Owner: "actions", Repo: "checkout", Ref: "v4", SHA: shaV4}}, snap.SetupJob)
-		assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceDownloaded}}, snap.Worker)
+		assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}}, snap.Worker)
 	})
 	t.Run("verify when the setup buffer is already gone then the Worker log is still read", func(t *testing.T) {
 		dir := writeDiag(t, map[string]string{"Worker_20261005-050652-utc.log": workerStart + download(shaV4)})
@@ -42,6 +42,17 @@ func TestReadRunnerDiag(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, snap.SetupJob)
 		assert.Len(t, snap.Worker, 1)
+	})
+	t.Run("verify when part of the setup buffer cannot be read then the rest and the Worker log are still read", func(t *testing.T) {
+		dir := writeDiag(t, map[string]string{
+			"pages":                          "a file where the runner keeps a folder, so it cannot be listed",
+			"blocks/b_1.log":                 "Download action repository 'actions/checkout@v4' (SHA:" + shaV4 + ")\n",
+			"Worker_20261005-050652-utc.log": workerStart + download(shaV4),
+		})
+		snap, err := ReadRunnerDiag(dir)
+		require.NoError(t, err, "the Worker log does not depend on the setup buffer")
+		assert.Equal(t, []LoggedAction{{Owner: "actions", Repo: "checkout", Ref: "v4", SHA: shaV4}}, snap.SetupJob)
+		assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}}, snap.Worker)
 	})
 	t.Run("verify when the Worker log rolled over then it reads across a rollover", func(t *testing.T) {
 		dir := writeDiag(t, map[string]string{
@@ -51,7 +62,7 @@ func TestReadRunnerDiag(t *testing.T) {
 		})
 		snap, err := ReadRunnerDiag(dir)
 		require.NoError(t, err)
-		assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceDownloaded}}, snap.Worker)
+		assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}}, snap.Worker)
 		assert.Equal(t, []string{"Worker_20261005-050652-utc.log", "Worker_20261005-051117-utc.log"}, snap.WorkerFiles)
 	})
 	t.Run("verify when no Worker log starts a process then it fails", func(t *testing.T) {

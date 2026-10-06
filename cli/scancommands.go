@@ -708,55 +708,65 @@ func CurationActionsCmd(c *components.Context) error {
 	}
 	switch mode {
 	case installHook:
-		jfPath, err := os.Executable()
-		if err != nil {
-			return errorutils.CheckError(err)
-		}
-		homeDir, err := coreutils.GetJfrogHomeDir()
-		if err != nil {
-			return err
-		}
-		serverID := c.GetStringFlagValue(flags.ServerId)
-		// With nothing configured this returns an empty server rather than an error, so check the URL.
-		details, err := coreConfig.GetSpecificConfig(serverID, true, false)
-		if err != nil {
-			return fmt.Errorf("no JFrog server %q is configured - run 'jf config add' first: %w", serverID, err)
-		}
-		if err = curation.RequireArtifactoryServer(details); err != nil {
-			return err
-		}
-		warnings, err := runnerhook.Install(runnerhook.InstallOptions{RunnerDir: runnerDir, JfPath: jfPath, JfrogHomeDir: homeDir, ServerID: serverID})
-		if err != nil {
-			return err
-		}
-		for _, warning := range warnings {
-			log.Warn(warning)
-		}
-		log.Info("Installed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
-		return nil
+		return installCurationActionsHook(c, runnerDir)
 	case uninstallHook:
 		if err = runnerhook.Uninstall(runnerDir); err != nil {
 			return err
 		}
 		log.Info("Removed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
 		return nil
+	default: // curateAsStep, curateAsHook
+		threads, err := pluginsCommon.GetThreadsCount(c)
+		if err != nil {
+			return err
+		}
+		serverDetails, err := pluginsCommon.CreateServerDetailsWithConfigOffer(c, true, cliutils.Rt)
+		if err != nil {
+			return err
+		}
+		if err = curation.RequireArtifactoryServer(serverDetails); err != nil {
+			return err
+		}
+		cmd := curation.NewCurationActionsCommand().SetServerDetails(serverDetails).SetParallelRequests(threads)
+		if mode == curateAsHook {
+			cmd.SetRunnerDir(runnerDir)
+		}
+		return cmd.Run()
+	}
+}
+
+// installCurationActionsHook installs curate-gh-actions as the job-started hook of the runner in runnerDir.
+func installCurationActionsHook(c *components.Context, runnerDir string) error {
+	jfPath, err := os.Executable()
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	homeDir, err := coreutils.GetJfrogHomeDir()
+	if err != nil {
+		return err
+	}
+	serverID := c.GetStringFlagValue(flags.ServerId)
+	// With nothing configured this returns an empty server rather than an error, so check the URL.
+	details, err := coreConfig.GetSpecificConfig(serverID, true, false)
+	if err != nil {
+		return fmt.Errorf("no JFrog server %q is configured - run 'jf config add' first: %w", serverID, err)
+	}
+	if err = curation.RequireArtifactoryServer(details); err != nil {
+		return err
 	}
 	threads, err := pluginsCommon.GetThreadsCount(c)
 	if err != nil {
 		return err
 	}
-	serverDetails, err := pluginsCommon.CreateServerDetailsWithConfigOffer(c, true, cliutils.Rt)
+	warnings, err := runnerhook.Install(runnerhook.InstallOptions{RunnerDir: runnerDir, JfPath: jfPath, JfrogHomeDir: homeDir, ServerID: serverID, Threads: threads})
 	if err != nil {
 		return err
 	}
-	if err = curation.RequireArtifactoryServer(serverDetails); err != nil {
-		return err
+	for _, warning := range warnings {
+		log.Warn(warning)
 	}
-	cmd := curation.NewCurationActionsCommand().SetServerDetails(serverDetails).SetParallelRequests(threads)
-	if mode == curateAsHook {
-		cmd.SetRunnerDir(runnerDir)
-	}
-	return cmd.Run()
+	log.Info("Installed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
+	return nil
 }
 
 var supportedCommandsForPostInstallationFailure = datastructures.MakeSetFromElements[string](

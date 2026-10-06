@@ -35,32 +35,32 @@ func TestParseWorkerLog(t *testing.T) {
 			name: "verify when no cache is configured then the download line names the action",
 			log: "[2026-10-01 06:43:29Z INFO ActionManager] Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + "' into /r/_work/_actions/_temp_1/x.tar.gz.\n" +
 				"[2026-10-01 06:43:31Z INFO ActionManager] Request URL: https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + " X-GitHub-Request-Id: A Http Status: OK\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceDownloaded}},
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
 		},
 		{
-			name: "verify when only the download line is logged then it is downloaded",
+			name: "verify when only the download line is logged then it names the action",
 			log:  "Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + "' into /r/_work/_actions/_temp_1/x.tar.gz.\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceDownloaded}},
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
 		},
 		{
-			name: "verify when the unpacked cache serves an action then it is a symlink",
+			name: "verify when the symlink check names an action then it is listed",
 			log: "[x INFO ActionManager] Checking if can symlink 'actions/checkout@" + shaV4 + "'\n" +
 				"[x INFO ActionManager] Found unpacked action directory '/c/actions_checkout/" + shaV4 + "' in cache directory '/c'\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCacheSymlink}},
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
 		},
 		{
-			name: "verify when the archive cache serves an action then it is an archive copy",
+			name: "verify when the archive check names an action then it is listed",
 			log: "[x INFO ActionManager] Check if action archive 'actions/setup-node@" + shaNode + "' already exists in cache directory '/c'\n" +
 				"[x INFO ActionManager] Found action archive '/c/actions_setup-node/" + shaNode + ".tar.gz' in cache directory '/c'\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceCacheArchive}},
+			want: []WorkerAction{{Owner: "actions", Repo: "setup-node", SHA: shaNode}},
 		},
 		{
-			name: "verify when a symlink attempt falls through to a download then it is downloaded",
+			name: "verify when a symlink attempt falls through to a download then the action is listed once",
 			log: "Checking if can symlink 'actions/checkout@" + shaV3 + "'\n" +
 				"Check if action archive 'actions/checkout@" + shaV3 + "' already exists in cache directory '/c'\n" +
 				"Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + "' into /r/t.tar.gz.\n" +
 				"Request URL: https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + " X-GitHub-Request-Id: B Http Status: OK\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV3, Source: SourceDownloaded}},
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV3}},
 		},
 		{
 			name: "verify when Windows paths and zipball URLs are logged then they are understood",
@@ -69,8 +69,8 @@ func TestParseWorkerLog(t *testing.T) {
 				"Save archive 'https://api.github.com/repos/actions/setup-node/zipball/" + shaNode + "' into C:\\r\\t.zip.\n" +
 				"Request URL: https://api.github.com/repos/actions/setup-node/zipball/" + shaNode + " X-GitHub-Request-Id: C\n",
 			want: []WorkerAction{
-				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCacheSymlink},
-				{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceDownloaded},
+				{Owner: "actions", Repo: "checkout", SHA: shaV4},
+				{Owner: "actions", Repo: "setup-node", SHA: shaNode},
 			},
 		},
 		{
@@ -79,8 +79,8 @@ func TestParseWorkerLog(t *testing.T) {
 				"Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + "' into x\n" +
 				"Checking if can symlink 'Actions/Checkout@" + "11D5960A326750D5838078E36CF38B85AF677262" + "'\n",
 			want: []WorkerAction{
-				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceUnknown},
-				{Owner: "actions", Repo: "checkout", SHA: shaV3, Source: SourceDownloaded},
+				{Owner: "actions", Repo: "checkout", SHA: shaV4},
+				{Owner: "actions", Repo: "checkout", SHA: shaV3},
 			},
 		},
 		{

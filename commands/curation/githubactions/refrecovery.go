@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// AttachRunnerProvenance gives each walked action the SHA and source the runner's logs name for it.
+// AttachRunnerProvenance gives each walked action the SHA the runner's logs name for it.
 // refs keeps walked's order and length; unplaced is every Worker action no ref was given.
 //
 // The ref for a SHA comes from, in order:
@@ -54,7 +54,6 @@ func AttachRunnerProvenance(walked []ActionRef, setupJob []LoggedAction, worker 
 		if k := bySHA(repoKey(refs[i].Owner, refs[i].Repo), sha); k >= 0 {
 			placed[k] = true
 			refs[i].RunnerSHA = worker[k].SHA
-			refs[i].Source = worker[k].Source
 		}
 	}
 
@@ -203,25 +202,7 @@ func RefsFromSetupJob(setupJob []LoggedAction, worker []WorkerAction, actionsCac
 			Ref:       l.Ref,
 			Path:      filepath.Join(actionsCacheDir, l.Owner, l.Repo, filepath.FromSlash(l.Ref)),
 			RunnerSHA: sha,
-			Source:    sourceOfSHA(worker, repoKey(l.Owner, l.Repo), sha),
 		})
 	}
 	return refs, true
-}
-
-// sourceOfSHA returns how the runner materialized sha, preferring the Worker entry named repo.
-func sourceOfSHA(worker []WorkerAction, repo, sha string) ActionSource {
-	source := SourceUnknown
-	for _, w := range worker {
-		if w.SHA != sha {
-			continue
-		}
-		if repoKey(w.Owner, w.Repo) == repo {
-			return w.Source
-		}
-		if source == SourceUnknown {
-			source = w.Source
-		}
-	}
-	return source
 }

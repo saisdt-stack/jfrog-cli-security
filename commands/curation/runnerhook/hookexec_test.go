@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	fakeJfExitEnv       = "RUNNERHOOK_TEST_FAKE_JF_EXIT"
-	traceEnv            = "RUNNERHOOK_TEST_TRACE"
-	previousHookExitEnv = "RUNNERHOOK_TEST_PREVIOUS_EXIT"
+	fakeJfExitEnv    = "RUNNERHOOK_TEST_FAKE_JF_EXIT"
+	traceEnv         = "RUNNERHOOK_TEST_TRACE"
+	adminHookExitEnv = "RUNNERHOOK_TEST_ADMIN_EXIT"
 )
 
 // TestMain lets this test binary stand in for the jf a generated hook calls: with fakeJfExitEnv set
@@ -83,6 +83,7 @@ func fakeJfBinary(t *testing.T) string {
 func quotedRunnerDir(t *testing.T) string {
 	t.Helper()
 	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv(HookEnvVar, "")
 	name := "runner's-dir"
 	if runtime.GOOS == "windows" {
 		name = "runner dir"
@@ -94,18 +95,18 @@ func quotedRunnerDir(t *testing.T) string {
 	return dir
 }
 
-// previousHook writes a hook that records that it ran and exits with previousHookExitEnv.
-func previousHook(t *testing.T, dir string) string {
+// adminHookCalling writes an admin's hook that runs script with the line Install asks for, then
+// records that it went on and exits with adminHookExitEnv.
+func adminHookCalling(t *testing.T, script string) string {
 	t.Helper()
+	path := filepath.Join(t.TempDir(), hookName())
+	content := callLine(path, script) + "\n"
 	if runtime.GOOS == "windows" {
-		path := filepath.Join(dir, "previous-hook.ps1")
-		require.NoError(t, os.WriteFile(path, []byte(
-			"Add-Content -LiteralPath $env:"+traceEnv+" -Value 'previous'\nexit [int]$env:"+previousHookExitEnv+"\n"), 0o644))
-		return path
+		content += "Add-Content -LiteralPath $env:" + traceEnv + " -Value 'admin'\nexit [int]$env:" + adminHookExitEnv + "\n"
+	} else {
+		content += "echo admin >> \"$" + traceEnv + "\"\nexit \"$" + adminHookExitEnv + "\"\n"
 	}
-	path := filepath.Join(dir, "previous-hook.sh")
-	require.NoError(t, os.WriteFile(path, []byte(
-		"echo previous >> \"$"+traceEnv+"\"\nexit \"$"+previousHookExitEnv+"\"\n"), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	return path
 }
 
@@ -156,58 +157,49 @@ func readTrace(t *testing.T, path string) []string {
 	return strings.Split(strings.TrimSpace(strings.ReplaceAll(string(content), "\r\n", "\n")), "\n")
 }
 
-// anyFailure is a wanted exit code that only has to be non-zero: bash reports a missing script as
-// 127 or 1 depending on its version.
-const anyFailure = -1
-
 func TestInstalledHookRunsLikeTheRunner(t *testing.T) {
 	jf := fakeJfBinary(t)
 	tests := []struct {
-		name         string
-		jfExit       int
-		withPrevious bool
-		previousExit int
-		wantExit     int
-		wantPrevious bool
-		// removePrevious deletes the chained hook after install, as when an admin removes it later.
-		removePrevious bool
+		name string
+		// viaAdminHook runs the admin's hook, which calls ours with callLine, rather than ours directly.
+		viaAdminHook  bool
+		jfExit        int
+		adminHookExit int
+		wantExit      int
+		wantAdminHook bool
 	}{
-		{name: "verify when jf approves and nothing is chained then the hook passes", jfExit: 0, wantExit: 0},
+		{name: "verify when jf approves then the hook passes", jfExit: 0, wantExit: 0},
 		{name: "verify when jf rejects then the hook fails with jf's exit code", jfExit: 3, wantExit: 3},
-		{name: "verify when jf approves then the chained hook runs after it and decides the exit code", jfExit: 0, withPrevious: true, previousExit: 5, wantExit: 5, wantPrevious: true},
-		{name: "verify when jf rejects then the chained hook does not run", jfExit: 2, withPrevious: true, previousExit: 0, wantExit: 2},
-		{name: "verify when the chained hook is gone then the hook fails as the runner would", jfExit: 0, withPrevious: true, removePrevious: true, wantExit: anyFailure},
+		{name: "verify when jf approves then the admin's hook goes on and decides the exit code", viaAdminHook: true, jfExit: 0, adminHookExit: 5, wantExit: 5, wantAdminHook: true},
+		{name: "verify when jf rejects then the admin's hook stops and fails", viaAdminHook: true, jfExit: 2, adminHookExit: 0, wantExit: 2},
 	}
 	for shellName, shell := range hookShells(t) {
 		for _, tt := range tests {
 			t.Run(shellName+"/"+tt.name, func(t *testing.T) {
 				dir := quotedRunnerDir(t)
-				var previous string
-				if tt.withPrevious {
-					previous = previousHook(t, t.TempDir())
-					require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(HookEnvVar+"="+previous+"\n"), 0o644))
+				run := filepath.Join(dir, hookFolder, flavorFor(runtime.GOOS).scriptName)
+				if tt.viaAdminHook {
+					run = adminHookCalling(t, run)
+					require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte(HookEnvVar+"="+run+"\n"), 0o644))
 				}
 				home := filepath.Join(t.TempDir(), "admin's ’.jfrog é")
-				_, err := Install(InstallOptions{RunnerDir: dir, JfPath: jf, JfrogHomeDir: home, ServerID: "prod"})
+				_, err := Install(InstallOptions{RunnerDir: dir, JfPath: jf, JfrogHomeDir: home, ServerID: "prod", Threads: 4})
 				require.NoError(t, err)
-				if tt.removePrevious {
-					require.NoError(t, os.Remove(previous))
-				}
 				trace := filepath.Join(t.TempDir(), "trace.log")
 
-				got := runHook(t, shell(filepath.Join(dir, hookFolder, flavorFor(runtime.GOOS).scriptName)),
-					fakeJfExitEnv+"="+strconv.Itoa(tt.jfExit), traceEnv+"="+trace, previousHookExitEnv+"="+strconv.Itoa(tt.previousExit))
+				got := runHook(t, shell(run),
+					fakeJfExitEnv+"="+strconv.Itoa(tt.jfExit), traceEnv+"="+trace, adminHookExitEnv+"="+strconv.Itoa(tt.adminHookExit))
 
-				if runtime.GOOS == "windows" || tt.wantExit == anyFailure {
+				if runtime.GOOS == "windows" {
 					// Under powershell -command an exit inside the dot-sourced hook ends the script only, and
 					// the host then reports 1 for any failure. The runner fails the job on any non-zero code.
-					assert.Equal(t, tt.wantExit != 0, got != 0, "the hook must fail exactly when jf or the chained hook fails, got exit code %d", got)
+					assert.Equal(t, tt.wantExit != 0, got != 0, "the hook must fail exactly when jf or the admin's hook fails, got exit code %d", got)
 				} else {
 					assert.Equal(t, tt.wantExit, got, "the hook's exit code is what fails or passes the job")
 				}
-				want := []string{"jf curate-gh-actions --runner-hook --runner-dir " + dir + " home=" + home + " server=prod"}
-				if tt.wantPrevious {
-					want = append(want, "previous")
+				want := []string{"jf curate-gh-actions --runner-hook --runner-dir " + dir + " --threads 4 home=" + home + " server=prod"}
+				if tt.wantAdminHook {
+					want = append(want, "admin")
 				}
 				assert.Equal(t, want, readTrace(t, trace))
 			})

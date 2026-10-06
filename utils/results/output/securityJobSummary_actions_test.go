@@ -284,3 +284,36 @@ func TestGenerateActionsCurationSectionMarkdown_LocalActionSharedBySeveralScansI
 	require.NoError(t, err)
 	assert.Equal(t, 1, strings.Count(markdown, "./.github/actions/setup"))
 }
+
+func TestGenerateActionsCurationSectionMarkdownEndsTheTableBeforeTheCaveat(t *testing.T) {
+	// A markdown table ends only at a blank line, so a caveat on the very next line would render as
+	// one more table row.
+	tests := []struct {
+		name    string
+		curated formats.CuratedActions
+		caveat  string
+	}{
+		{
+			name:    "verify when no workflow file was available then the unconditional caveat follows a blank line",
+			curated: formats.CuratedActions{Actions: []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}},
+			caveat:  "Local composite actions",
+		},
+		{
+			name: "verify when a local composite action was found then the caveat naming it follows a blank line",
+			curated: formats.CuratedActions{
+				Attributed:            true,
+				Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
+				LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
+			},
+			caveat: "Not covered",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			curated := tt.curated
+			markdown, err := GenerateActionsCurationSectionMarkdown([]formats.ResultsSummary{{Scans: []formats.ScanSummary{{CuratedActions: &curated}}}})
+			require.NoError(t, err)
+			assert.Contains(t, markdown, "|\n\n"+tt.caveat)
+		})
+	}
+}

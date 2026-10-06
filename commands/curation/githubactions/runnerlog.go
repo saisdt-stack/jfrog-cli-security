@@ -19,12 +19,6 @@ var (
 	symlinkCheckRe = regexp.MustCompile(`Checking if can symlink '([^/'@]+)/([^'@]+)@([0-9a-fA-F]{40,64})'`)
 	archiveCheckRe = regexp.MustCompile(`Check if action archive '([^/'@]+)/([^'@]+)@([0-9a-fA-F]{40,64})'`)
 	saveArchiveRe  = regexp.MustCompile(`Save archive 'https?://[^']*?/([^/']+)/([^/']+)/(?:tar\.gz|zip|tarball|zipball)/([0-9a-fA-F]{40,64})'`)
-
-	// How the action was materialized. A symlink attempt that fails falls through to the archive and
-	// then to a download, so a later, more expensive outcome wins over an earlier one.
-	unpackedFoundRe = regexp.MustCompile(`Found unpacked action directory '[^']*[\\/]([0-9a-fA-F]{40,64})'`)
-	archiveFoundRe  = regexp.MustCompile(`Found action archive '[^']*[\\/]([0-9a-fA-F]{40,64})\.(?:tar\.gz|zip)'`)
-	requestURLRe    = regexp.MustCompile(`Request URL: https?://\S*/([0-9a-fA-F]{40,64}) `)
 )
 
 // LoggedAction is one action as the runner's "Set up job" output names it.
@@ -32,10 +26,9 @@ type LoggedAction struct {
 	Owner, Repo, Ref, SHA string
 }
 
-// WorkerAction is one action the Worker log shows the runner materializing, with how it did.
+// WorkerAction is one action the Worker log shows the runner materializing.
 type WorkerAction struct {
 	Owner, Repo, SHA string
-	Source           ActionSource
 }
 
 // ParseSetupJobLines returns each action the "Set up job" output names, once, in the order named.
@@ -59,14 +52,6 @@ func ParseSetupJobLines(text string) []LoggedAction {
 func ParseWorkerLog(text string) []WorkerAction {
 	var actions []WorkerAction
 	index := map[string]int{}
-	source := map[string]ActionSource{}
-	rank := map[ActionSource]int{SourceUnknown: 0, SourceCacheSymlink: 1, SourceCacheArchive: 2, SourceDownloaded: 3}
-	note := func(sha string, s ActionSource) {
-		sha = strings.ToLower(sha)
-		if rank[s] > rank[source[sha]] {
-			source[sha] = s
-		}
-	}
 	for _, line := range strings.Split(text, "\n") {
 		for _, re := range []*regexp.Regexp{symlinkCheckRe, archiveCheckRe, saveArchiveRe} {
 			m := re.FindStringSubmatch(line)
@@ -79,24 +64,7 @@ func ParseWorkerLog(text string) []WorkerAction {
 				index[key] = len(actions)
 				actions = append(actions, WorkerAction{Owner: strings.ToLower(m[1]), Repo: strings.ToLower(m[2]), SHA: sha})
 			}
-			if re == saveArchiveRe {
-				// Written only on the download path, so it proves a download even when the
-				// Request URL line is missing (that one needs an X-GitHub-Request-Id header).
-				note(sha, SourceDownloaded)
-			}
 		}
-		if m := unpackedFoundRe.FindStringSubmatch(line); m != nil {
-			note(m[1], SourceCacheSymlink)
-		}
-		if m := archiveFoundRe.FindStringSubmatch(line); m != nil {
-			note(m[1], SourceCacheArchive)
-		}
-		if m := requestURLRe.FindStringSubmatch(line); m != nil {
-			note(m[1], SourceDownloaded)
-		}
-	}
-	for i := range actions {
-		actions[i].Source = source[actions[i].SHA]
 	}
 	return actions
 }

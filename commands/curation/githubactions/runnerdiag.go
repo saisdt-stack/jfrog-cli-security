@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
+	"github.com/jfrog/jfrog-client-go/utils/log"
 )
 
 // workerStartMarker is the line every Worker process writes first. A file without it is a
@@ -32,6 +33,10 @@ type DiagSnapshot struct {
 // The Worker logs read are this process's: newest first, back to the one holding workerStartMarker,
 // because a large job rolls to a new file at WORKER_LOGSIZE. The runner runs one job at a time, so
 // the newest file belongs to the running job.
+//
+// A part of the setup buffer that cannot be read is skipped rather than failing the read: the Worker
+// log does not depend on it, and every setup line is later checked against the Worker log, so a
+// missing one costs at most the fast path.
 func ReadRunnerDiag(runnerDir string) (DiagSnapshot, error) {
 	diag := filepath.Join(runnerDir, "_diag")
 	var setup strings.Builder
@@ -41,18 +46,21 @@ func ReadRunnerDiag(runnerDir string) (DiagSnapshot, error) {
 			continue
 		}
 		if err != nil {
-			return DiagSnapshot{}, errorutils.CheckError(err)
+			log.Warn(fmt.Sprintf("Skipping the runner's setup buffer %q, which cannot be read: %v", filepath.Join(diag, sub), err))
+			continue
 		}
 		for _, entry := range entries {
 			if entry.IsDir() {
 				continue
 			}
-			content, err := os.ReadFile(filepath.Join(diag, sub, entry.Name()))
+			path := filepath.Join(diag, sub, entry.Name())
+			content, err := os.ReadFile(path)
 			if errors.Is(err, os.ErrNotExist) {
 				continue // uploaded and deleted between the listing and the read
 			}
 			if err != nil {
-				return DiagSnapshot{}, errorutils.CheckError(err)
+				log.Warn(fmt.Sprintf("Skipping the runner's setup buffer %q, which cannot be read: %v", path, err))
+				continue
 			}
 			setup.Write(content)
 			setup.WriteByte('\n')
