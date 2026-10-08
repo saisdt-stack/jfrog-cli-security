@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
@@ -48,7 +49,7 @@ type runnerLogDiscoverer struct {
 func (d runnerLogDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 	// First, before anything slow: the runner deletes the "Set up job" buffer seconds after the hook
 	// starts.
-	snapshot, diagErr := githubactions.ReadRunnerDiag(d.runnerDir)
+	snapshot, diagErr := githubactions.ReadRunnerDiag(d.runnerDir, githubactions.RunIdentityFromEnv(), time.Now())
 	if diagErr == nil {
 		if refs, ok := githubactions.RefsFromSetupJob(snapshot.SetupJob, snapshot.Worker, d.actionsCacheDir); ok {
 			// Every action has its ref and SHA from the runner itself, and the decision is by SHA, so

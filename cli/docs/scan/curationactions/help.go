@@ -14,8 +14,9 @@ When to use:
 Prerequisites:
 - Must run on a GitHub Actions runner; elsewhere it reports an error.
 - A configured JFrog server (jf config, or jfrog/setup-jfrog-cli earlier in the job). Pick a non-default one with --server-id or JFROG_CLI_SERVER_ID; on a runner with an existing JFrog configuration, select setup-jfrog-cli's server explicitly with JFROG_CLI_SERVER_ID=setup-jfrog-cli-server (or the action's custom-server-id).
+- Low-value credentials: the job can read whatever credentials the check uses - as a step they are the job's own, and the hook runs as the same user as the job's steps. The check only reads the git refs and archives of the GitHub Actions VCS remote repository, so configure an access token, not a username and password, whose user or group has read permission on that repository only, with an expiry, and rotate it. As a step, prefer jfrog/setup-jfrog-cli with OIDC, with the identity mapping limited the same way.
 - A self-signed or internal-CA Artifactory needs its CA certificate in the runner's trust store or ~/.jfrog/security/certs; TLS verification cannot be turned off.
-- For the hook: the runner's installation directory. The hook script, the jf binary and the jf configuration must be writable by the admin only and readable by the runner's service account (on Windows the default NETWORK SERVICE account usually cannot read a user profile). On a Windows desktop without PowerShell 7, allow local scripts with an execution policy such as RemoteSigned.
+- For the hook: the runner's installation directory, and a JFrog CLI home of its own. Install pins the home it runs with, and every job on the runner can read that configuration, so run install with JFROG_CLI_HOME_DIR set to a folder that holds only the low-value token above - not your own ~/.jfrog. The hook script, the jf binary and that folder must be writable by the admin only and readable by the runner's service account (on Windows the default NETWORK SERVICE account usually cannot read a user profile). An expired or revoked token fails every job on the runner until it is replaced. On a Windows desktop without PowerShell 7, allow local scripts with an execution policy such as RemoteSigned.
 
 Common patterns:
   $ jf curate-gh-actions
@@ -51,6 +52,9 @@ A: Raise --threads, e.g. jf curate-gh-actions --threads 8. The default is 3.
 
 Q: How do I make sure every job on my self-hosted runner is curated, before any action code runs?
 A: Install it as the runner's job-started hook: jf curate-gh-actions --install-runner-hook --runner-dir <runner directory>, then restart the runner. For ephemeral or autoscaled runners, run the install after the runner is configured and before it starts, in the image build or the start script.
+
+Q: Can a job on my self-hosted runner read the JFrog credentials the hook uses?
+A: Yes. The hook runs as the runner's service account, the same user as the job's steps, so the jf configuration it reads is readable by every job. Install with JFROG_CLI_HOME_DIR set to a folder holding only an expiring access token that can read just the GitHub Actions VCS remote repository, and rotate that token.
 
 Q: My runner already has a job-started hook. Can I still install the check?
 A: Yes. The runner runs only one hook, so install keeps yours and prints the line to add as its first command; run install again to confirm.

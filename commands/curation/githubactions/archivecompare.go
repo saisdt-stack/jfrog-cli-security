@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,6 +36,9 @@ type ArchiveComparison struct {
 	FirstDifference string
 	// Missing reports that FirstDifference is absent on the runner rather than different there.
 	Missing bool
+	// Extra reports that FirstDifference is a manifest only the runner holds, which the runner loads
+	// in place of the archive's.
+	Extra bool
 	// PaxSHA is the pax global header's comment when it is a full object id, else "".
 	PaxSHA string
 }
@@ -43,7 +47,8 @@ type ArchiveComparison struct {
 // the tar.gz archive at archivePath, streaming the archive without extracting it.
 //
 // Only the archive's entries are checked: files the runner or the action added to its own directory
-// are expected and ignored. The pass stops at the first entry that is missing or differs, since the
+// are expected and ignored - except a manifest the runner would load in place of one of the
+// archive's (see shadowingManifest). The pass stops at the first entry that is missing or differs, since the
 // verdict is known by then. A symlink entry matches the forms a runner leaves one in: a symlink with
 // the same target; on Windows, which unzips it so, a file holding the link path; elsewhere, where
 // the target is copied, the target's bytes or - for a link to a directory - a tree equal to the
@@ -138,8 +143,89 @@ func CompareArchive(archivePath, runnerDir string) (comparison ArchiveComparison
 			return comparison, nil
 		}
 	}
+	shadowing, err := shadowingManifest(root, matched)
+	if err != nil {
+		return ArchiveComparison{}, fmt.Errorf("looking for a manifest only the runner holds: %w", err)
+	}
+	if shadowing != "" {
+		comparison.FirstDifference, comparison.Extra = shadowing, true
+		return comparison, nil
+	}
 	comparison.Identical = true
 	return comparison, nil
+}
+
+// manifestNames are the files the runner looks for in the one directory a uses: names - the action's
+// root or its path - in its order (actions/runner, src/Runner.Worker/ActionManager.cs:714-905): it
+// loads the first one it finds there and ignores the rest.
+var manifestNames = []string{"action.yml", "action.yaml", "Dockerfile", "dockerfile"}
+
+// shadowingManifest returns the first manifest that only the runner holds and that the runner would
+// load in place of one of the archive's own, or "" when there is none. Adding one is all a moved tag
+// needs to change what an action runs while every archive entry still matches.
+//
+// Only the directories holding an archive manifest are checked: a uses: naming any other directory
+// could not have run the approved version, and an action may write a Dockerfile of its own elsewhere.
+func shadowingManifest(root string, matched map[string]bool) (string, error) {
+	dirs := map[string]bool{}
+	for rel := range matched {
+		if slices.Contains(manifestNames, path.Base(rel)) {
+			dirs[entryDir(rel)] = true
+		}
+	}
+	for _, dir := range slices.Sorted(maps.Keys(dirs)) {
+		for _, name := range manifestNames {
+			rel := path.Join(dir, name)
+			if matched[rel] {
+				break // the runner loads the archive's own manifest here
+			}
+			info, err := os.Lstat(runnerPath(root, rel))
+			if isMissing(err) {
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+			if info.IsDir() {
+				continue // the runner looks for a file
+			}
+			own, err := isArchiveEntry(root, dir, name, info, matched)
+			if err != nil {
+				return "", err
+			}
+			if own {
+				break // a case-insensitive file system answered with the archive's own manifest
+			}
+			return rel, nil
+		}
+	}
+	return "", nil
+}
+
+// isArchiveEntry reports whether info, found at name in dir on the runner, is the file of an archive
+// entry in dir whose name differs only in case: on macOS and Windows, Dockerfile opens dockerfile.
+func isArchiveEntry(root, dir, name string, info fs.FileInfo, matched map[string]bool) (bool, error) {
+	for rel := range matched {
+		if entryDir(rel) != dir || !strings.EqualFold(path.Base(rel), name) {
+			continue
+		}
+		entryInfo, err := os.Lstat(runnerPath(root, rel))
+		if err != nil {
+			return false, err
+		}
+		if os.SameFile(info, entryInfo) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// entryDir is the directory of the archive entry rel, "" for the archive's root.
+func entryDir(rel string) string {
+	if dir := path.Dir(rel); dir != "." {
+		return dir
+	}
+	return ""
 }
 
 // stripTopDir returns hdr's name below the archive's single top-level directory, recording that

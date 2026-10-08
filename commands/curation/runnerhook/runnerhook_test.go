@@ -375,6 +375,7 @@ func TestTamperWarnings(t *testing.T) {
 	assert.Contains(t, warnings[0], `C:\jf\jf.exe`)
 	assert.Contains(t, warnings[1], `C:\Users\admin\.jfrog`)
 	assert.Contains(t, warnings[1], `NETWORK SERVICE`)
+	assert.Contains(t, warnings[1], "JFROG_CLI_HOME_DIR", "the warning must steer to a dedicated configuration, not the admin's own")
 }
 
 func TestCheckInstallableUsesTheRunnersConfigureScript(t *testing.T) {

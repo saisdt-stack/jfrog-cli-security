@@ -85,12 +85,24 @@ const (
 )
 
 // hookRunner lays out a runner directory: _diag files, and _work/_actions entries with watermarks.
+// It sets this job's run identity and, as the runner does, writes the job message naming that run
+// right after each Worker start line.
 func hookRunner(t *testing.T, diag map[string]string, cacheDirs []string) (runnerDir, cacheDir string) {
 	t.Helper()
+	t.Setenv(githubactions.RunIDEnvVar, "37295940958")
+	t.Setenv(githubactions.RunAttemptEnvVar, "1")
+	if os.Getenv(githubactions.GithubRepoEnvVar) == "" {
+		t.Setenv(githubactions.GithubRepoEnvVar, "octo/repo")
+	}
+	run := githubactions.RunIdentityFromEnv()
+	jobMessage := "[x INFO Worker] Job message:\n {\"contextData\": {\"github\": {\"t\": 2, \"d\": [" +
+		"{\"k\": \"repository\", \"v\": \"" + run.Repository + "\"}, {\"k\": \"run_id\", \"v\": \"" + run.RunID + "\"}, " +
+		"{\"k\": \"run_attempt\", \"v\": \"" + run.RunAttempt + "\"}]}}}\n"
 	runnerDir = t.TempDir()
 	for name, content := range diag {
 		path := filepath.Join(runnerDir, "_diag", filepath.FromSlash(name))
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		content = strings.ReplaceAll(content, "Worker] Version: 2.337.0\n", "Worker] Version: 2.337.0\n"+jobMessage)
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 	}
 	cacheDir = filepath.Join(runnerDir, "_work", "_actions")
@@ -112,6 +124,17 @@ func TestRunnerLogDiscoverer(t *testing.T) {
 		runnerDir, cacheDir := hookRunner(t, map[string]string{
 			"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
 			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4),
+		}, []string{"actions/checkout/v4"})
+		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
+		require.NoError(t, err)
+		require.Len(t, refs, 1)
+		assert.Equal(t, testShaV4, refs[0].RunnerSHA)
+	})
+	t.Run("verify when an earlier job planted a Worker log that sorts last then the runner's SHA still decides", func(t *testing.T) {
+		runnerDir, cacheDir := hookRunner(t, map[string]string{
+			"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
+			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4),
+			"Worker_29991231-235959-utc.log": start + save("checkout", testShaV3),
 		}, []string{"actions/checkout/v4"})
 		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
 		require.NoError(t, err)

@@ -180,8 +180,11 @@ func blockedNotes(reason, sha string) string {
 
 func mismatchNotes(comparison ArchiveComparison, sha string) string {
 	detail := "differs"
-	if comparison.Missing {
+	switch {
+	case comparison.Missing:
 		detail = "missing on the runner"
+	case comparison.Extra:
+		detail = "only on the runner"
 	}
 	notes := fmt.Sprintf("%s (%s %s)", contentMismatchNote, comparison.FirstDifference, detail)
 	if sha != "" {

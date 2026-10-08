@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -191,8 +192,10 @@ func TestArtifactoryDeciderContentMismatch(t *testing.T) {
 		name          string
 		ref           string
 		servedArchive []tarEntry
-		filename      string
-		wantNotes     string
+		// runnerFiles are written into the runner's copy besides runnerCache's.
+		runnerFiles map[string]string
+		filename    string
+		wantNotes   string
 	}{
 		{
 			name: "verify when a served file differs from the runner's then the verdict is Rejected naming it",
@@ -216,6 +219,17 @@ func TestArtifactoryDeciderContentMismatch(t *testing.T) {
 			wantNotes: "not able to decide since content is mismatched (dist/new.js missing on the runner)",
 		},
 		{
+			name: "verify when the runner holds a manifest it loads before the served one then the verdict is Rejected naming it",
+			ref:  "v4",
+			servedArchive: []tarEntry{
+				{name: top, dir: true},
+				{name: top + "action.yaml", content: "name: curated\n"},
+			},
+			runnerFiles: map[string]string{"action.yaml": "name: curated\n"},
+			filename:    "checkout-v4.tar.gz",
+			wantNotes:   "not able to decide since content is mismatched (action.yml only on the runner)",
+		},
+		{
 			name: "verify when a mismatch has a resolved SHA then the notes carry it",
 			ref:  "main",
 			servedArchive: []tarEntry{
@@ -232,6 +246,9 @@ func TestArtifactoryDeciderContentMismatch(t *testing.T) {
 			fake := approvingArtifactory(t, tt.filename)
 			fake.downloadBody = buildTarGz(t, tt.servedArchive...)
 			actionDir := runnerCache(t, tt.ref)
+			for name, content := range tt.runnerFiles {
+				require.NoError(t, os.WriteFile(filepath.Join(actionDir, name), []byte(content), 0o644))
+			}
 			before := snapshotDir(t, actionDir)
 			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: actionDir}
 

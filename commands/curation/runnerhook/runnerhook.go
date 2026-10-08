@@ -140,9 +140,10 @@ func tamperWarnings(goos string, opts InstallOptions, folder, script string) []s
 		return []string{
 			fmt.Sprintf("file permissions are not checked on Windows: allow only administrators to change %s, %s and %s "+
 				"(for example with icacls), since a job on this runner could otherwise change what the hook runs", folder, script, opts.JfPath),
-			fmt.Sprintf("the runner service account must be able to read the JFrog CLI configuration in %s: the default "+
-				`account, NT AUTHORITY\NETWORK SERVICE, usually cannot read a user profile - run the runner service as a `+
-				"dedicated account, or grant that account read access", opts.JfrogHomeDir),
+			fmt.Sprintf("the runner service account must be able to read the JFrog CLI configuration in %s, and so can every "+
+				`job on this runner: the default account, NT AUTHORITY\NETWORK SERVICE, usually cannot read a user profile - `+
+				"rather than granting it your own, set JFROG_CLI_HOME_DIR to a folder holding only a read-only token for the "+
+				"GitHub Actions VCS remote, configure that server there, and install again", opts.JfrogHomeDir),
 		}
 	}
 	var warnings []string

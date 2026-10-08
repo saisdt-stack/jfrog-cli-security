@@ -188,6 +188,48 @@ func TestCompareArchive(t *testing.T) {
 			want:    ArchiveComparison{Identical: true},
 		},
 		{
+			// The runner loads the first of action.yml, action.yaml, Dockerfile, dockerfile it finds, so a
+			// moved tag that only adds an earlier one replaces what the action runs.
+			name:    "verify when the runner holds a manifest the runner loads before the archive's then it differs",
+			archive: []tarEntry{topDir, {name: compareTop + "action.yaml", content: "name: curated\n"}},
+			runner:  runnerLayout{files: map[string]string{"action.yaml": "name: curated\n", "action.yml": "name: moved\n"}},
+			want:    ArchiveComparison{FirstDifference: "action.yml", Extra: true},
+		},
+		{
+			name:    "verify when the runner holds a manifest the runner loads after the archive's then they are identical",
+			archive: []tarEntry{topDir, actionYML},
+			runner:  runnerLayout{files: map[string]string{"action.yml": "name: curated\n", "action.yaml": "name: ignored\n"}},
+			want:    ArchiveComparison{Identical: true},
+		},
+		{
+			name:    "verify when the archive is a Dockerfile action and the runner adds a manifest then it differs",
+			archive: []tarEntry{topDir, {name: compareTop + "Dockerfile", content: "FROM curated\n"}},
+			runner:  runnerLayout{files: map[string]string{"Dockerfile": "FROM curated\n", "action.yaml": "name: moved\n"}},
+			want:    ArchiveComparison{FirstDifference: "action.yaml", Extra: true},
+		},
+		{
+			// uses: owner/repo/sub@ref loads sub's manifest the same way.
+			name:    "verify when the runner holds an earlier manifest in a sub-directory then it differs",
+			archive: []tarEntry{topDir, actionYML, {name: compareTop + "sub/", dir: true}, {name: compareTop + "sub/action.yaml", content: "name: sub\n"}},
+			runner:  runnerLayout{files: map[string]string{"action.yml": "name: curated\n", "sub/action.yaml": "name: sub\n", "sub/action.yml": "name: moved\n"}},
+			want:    ArchiveComparison{FirstDifference: "sub/action.yml", Extra: true},
+		},
+		{
+			// No uses: can name a directory the approved archive holds no manifest in, so the runner
+			// never loads one there - an action may build its own image in such a directory.
+			name:    "verify when the runner holds a manifest where the archive has none then they are identical",
+			archive: []tarEntry{topDir, actionYML, distDir, indexJS},
+			runner:  runnerLayout{files: map[string]string{"action.yml": "name: curated\n", "dist/index.js": "curated();\n", "dist/Dockerfile": "FROM built\n"}},
+			want:    ArchiveComparison{Identical: true},
+		},
+		{
+			// On macOS and Windows Dockerfile names the archive's own dockerfile, which is what the runner loads.
+			name:    "verify when the archive's manifest also answers to an earlier name by case then they are identical",
+			archive: []tarEntry{topDir, {name: compareTop + "dockerfile", content: "FROM curated\n"}},
+			runner:  runnerLayout{files: map[string]string{"dockerfile": "FROM curated\n"}},
+			want:    ArchiveComparison{Identical: true},
+		},
+		{
 			name:    "verify when a file is missing on the runner then it is reported missing",
 			archive: []tarEntry{topDir, actionYML, distDir, indexJS},
 			runner:  runnerLayout{files: map[string]string{"action.yml": "name: curated\n"}},
