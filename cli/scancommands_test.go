@@ -211,7 +211,7 @@ func TestCurationActionsMode(t *testing.T) {
 	tests := []struct {
 		name                       string
 		runnerHook, install, unins bool
-		fromPre                    bool
+		fromPre, fromPost          bool
 		trustActionCache           bool
 		runnerDir                  string
 		want                       curationActionsRunMode
@@ -234,10 +234,17 @@ func TestCurationActionsMode(t *testing.T) {
 		{name: "verify when from-pre is set with install then it fails", fromPre: true, install: true, runnerDir: "/r", wantErr: "--from-pre"},
 		{name: "verify when from-pre is set with uninstall then it fails", fromPre: true, unins: true, runnerDir: "/r", wantErr: "--from-pre"},
 		{name: "verify when from-pre is set with trust-action-cache then it fails", fromPre: true, trustActionCache: true, wantErr: "--trust-action-cache"},
+		{name: "verify when from-post is set alone then it reports from the post", fromPost: true, want: curateFromPost},
+		{name: "verify when from-post is set with from-pre then it fails", fromPost: true, fromPre: true, wantErr: "--from-post"},
+		{name: "verify when from-post is set with a runner dir then it fails", fromPost: true, runnerDir: "/r", wantErr: "--from-post"},
+		{name: "verify when from-post is set with runner-hook then it fails", fromPost: true, runnerHook: true, runnerDir: "/r", wantErr: "--from-post"},
+		{name: "verify when from-post is set with install then it fails", fromPost: true, install: true, runnerDir: "/r", wantErr: "--from-post"},
+		{name: "verify when from-post is set with uninstall then it fails", fromPost: true, unins: true, runnerDir: "/r", wantErr: "--from-post"},
+		{name: "verify when from-post is set with trust-action-cache then it fails", fromPost: true, trustActionCache: true, wantErr: "--from-post"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.fromPre, tt.trustActionCache, tt.runnerDir)
+			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.fromPre, tt.fromPost, tt.trustActionCache, tt.runnerDir)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)

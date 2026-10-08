@@ -31,7 +31,7 @@ func newInspector() (inspector, error) {
 		if _, parentCreated, err := imageAndCreation(ppid); err != nil || parentCreated > created {
 			ppid = 0
 		}
-		return processInfo{PID: pid, ParentPID: ppid, Exe: exe}, nil
+		return processInfo{ParentPID: ppid, Exe: exe}, nil
 	}, nil
 }
 

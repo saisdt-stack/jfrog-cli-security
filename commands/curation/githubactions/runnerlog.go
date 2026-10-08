@@ -11,8 +11,8 @@ import (
 // not say" and fall back to walking the action cache.
 var (
 	// The "Set up job" step prints this per action (:1212). It is the only line that names the ref
-	// and the SHA together.
-	setupJobLineRe = regexp.MustCompile(`Download action repository '([^/'@]+)/([^'@]+)@([^']+)' \(SHA:([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\)`)
+	// and the SHA together. It is matched anywhere on a line, so no capture may cross a line break.
+	setupJobLineRe = regexp.MustCompile(`Download action repository '([^/'@\r\n]+)/([^'@\r\n]+)@([^'\r\n]+)' \(SHA:([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\)`)
 
 	// Which of these three names an action depends on the cache configuration: the symlink check
 	// only runs with ACTIONS_RUNNER_SYMLINK_CACHED_ACTIONS (:1239), the archive check only with

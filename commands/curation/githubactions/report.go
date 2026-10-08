@@ -72,6 +72,11 @@ func RenderReportTable(rows []ActionReportRow, withParent bool) string {
 	return sb.String()
 }
 
+// Approved reports whether the row's Status is exactly ActionApproved.
+func (r ActionReportRow) Approved() bool {
+	return r.Status == string(ActionApproved)
+}
+
 // NotApproved returns every row whose Status is not exactly ActionApproved, for the command's
 // exit-code decision.
 //
@@ -79,7 +84,7 @@ func RenderReportTable(rows []ActionReportRow, withParent bool) string {
 func NotApproved(rows []ActionReportRow) []ActionReportRow {
 	var notApproved []ActionReportRow
 	for _, row := range rows {
-		if row.Status != string(ActionApproved) {
+		if !row.Approved() {
 			notApproved = append(notApproved, row)
 		}
 	}

@@ -176,6 +176,7 @@ const (
 	UninstallRunnerHook   = "uninstall-runner-hook"
 	TrustActionCache      = "trust-action-cache"
 	FromPre               = "from-pre"
+	FromPost              = "from-post"
 
 	// Unique git flags
 	gitPrefix       = "git-"
@@ -242,7 +243,7 @@ var commandFlags = map[string][]string{
 	CurationAudit: {
 		CurationOutput, WorkingDirs, Threads, RequirementsFile, InsecureTls, useWrapperAudit, UseIncludedBuilds, SolutionPath, DockerImageName, HuggingFaceModel, IncludeCachedPackages, MvnIncludePluginDeps, LegacyPeerDeps, RunNative, Script,
 	},
-	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook, TrustActionCache, FromPre},
+	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook, TrustActionCache, FromPre, FromPost},
 	GitCountContributors: {
 		InputFile, ScmType, ScmApiUrl, Token, Owner, RepoName, Months, DetailedSummary, InsecureTls, GitThreads, CacheValidity,
 	},
@@ -370,6 +371,7 @@ var flagsMap = map[string]components.Flag{
 	ActionsThreads:                components.NewStringFlag(Threads, "The number of GitHub Actions curated in parallel.", components.WithIntDefaultValue(cliutils.Threads)),
 	RunnerHook:                    components.NewBoolFlag(RunnerHook, "Run as a self-hosted runner's job-started hook. Set by the script --install-runner-hook writes.", components.SetHiddenBoolFlag()),
 	FromPre:                       components.NewBoolFlag(FromPre, "Run from the pre script of the action that wraps this command, which must be the job's first step. Set by that action.", components.SetHiddenBoolFlag()),
+	FromPost:                      components.NewBoolFlag(FromPost, "Run from the post script of the action that wraps this command, to report the actions the runner fetched after its pre. Set by that action.", components.SetHiddenBoolFlag()),
 	RunnerDir:                     components.NewStringFlag(RunnerDir, "The self-hosted runner's installation directory (the one holding config.sh, or config.cmd on Windows)."),
 	InstallRunnerHook:             components.NewBoolFlag(InstallRunnerHook, "Install this command as the job-started hook of the self-hosted runner in --runner-dir. A runner-admin operation, refused inside a job. If the runner already has a job-started hook, its .env is left as is and you are told the line to add to that hook. If the runner is already running, restart it afterwards."),
 	UninstallRunnerHook:           components.NewBoolFlag(UninstallRunnerHook, "Remove the job-started hook installed by --install-runner-hook from the runner in --runner-dir. Refused while another job-started hook still calls it. If the runner is already running, restart it afterwards."),

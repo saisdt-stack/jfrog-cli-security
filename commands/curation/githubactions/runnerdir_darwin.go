@@ -38,7 +38,7 @@ func inspectSysctl(pid int) (processInfo, error) {
 	if !ok {
 		return processInfo{}, fmt.Errorf("unexpected kern.procargs2 for process %d", pid)
 	}
-	info := processInfo{PID: pid, ParentPID: int(kp.Eproc.Ppid)}
+	info := processInfo{ParentPID: int(kp.Eproc.Ppid)}
 	// A relative exec path would have to be resolved against that process's working directory at exec
 	// time, which is unknown, so such a process is never taken for the Worker; the walk goes on.
 	if p := string(exe); filepath.IsAbs(p) {

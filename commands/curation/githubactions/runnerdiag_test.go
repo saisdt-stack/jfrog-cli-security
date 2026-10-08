@@ -123,7 +123,7 @@ const jobMessageLine = "[2026-10-05 05:06:52Z INFO Worker] Job message:\n "
 
 func TestParseJobMessage(t *testing.T) {
 	t.Run("verify when the job has four kinds of step then they are read in order", func(t *testing.T) {
-		facts, err := ParseJobMessage(jobMessageLine + `{
+		facts, err := parseJobMessage(jobMessageLine + `{
   "timeline": {"id": "32ef2141-1ecb-4383-a4cf-d6d9e08a9de6", "changeId": 0, "location": null},
   "steps": [
     {"type": "action", "reference": {"type": "repository", "name": "dattathallam/curate-pre-probe", "ref": "v2", "repositoryType": "GitHub"}, "name": "__curate"},
@@ -145,29 +145,29 @@ func TestParseJobMessage(t *testing.T) {
 		assert.False(t, facts.HasContainer)
 	})
 	t.Run("verify when a step is a local action then it carries no name or ref", func(t *testing.T) {
-		facts, err := ParseJobMessage(jobMessageLine + `{"steps": [{"reference": {"type": "repository", "repositoryType": "self", "path": "./.github/actions/x"}}]}`)
+		facts, err := parseJobMessage(jobMessageLine + `{"steps": [{"reference": {"type": "repository", "repositoryType": "self", "path": "./.github/actions/x"}}]}`)
 		require.NoError(t, err)
 		assert.Equal(t, []JobStep{{Type: "repository", RepositoryType: "self", Path: "./.github/actions/x"}}, facts.Steps)
 	})
 	t.Run("verify when a script repeats the marker and holds braces then the first message is read whole", func(t *testing.T) {
-		facts, err := ParseJobMessage(jobMessageLine + `{"steps": [{"reference": {"type": "script"}, "inputs": "echo 'Worker] Job message:' } {{ \"}\""},
+		facts, err := parseJobMessage(jobMessageLine + `{"steps": [{"reference": {"type": "script"}, "inputs": "echo 'Worker] Job message:' } {{ \"}\""},
  {"reference": {"type": "repository", "name": "a/b", "ref": "v1", "repositoryType": "GitHub"}}]}`)
 		require.NoError(t, err)
 		require.Len(t, facts.Steps, 2)
 		assert.Equal(t, "a/b", facts.Steps[1].Name)
 	})
 	t.Run("verify when the job has a container or services then they are reported, and null or absent means none", func(t *testing.T) {
-		facts, err := ParseJobMessage(jobMessageLine + `{"jobContainer": {"type": 2, "map": []}, "jobServiceContainers": {"type": 2, "map": [{"Key": "db"}]}}`)
+		facts, err := parseJobMessage(jobMessageLine + `{"jobContainer": {"type": 2, "map": []}, "jobServiceContainers": {"type": 2, "map": [{"Key": "db"}]}}`)
 		require.NoError(t, err)
 		assert.True(t, facts.HasContainer)
 		assert.True(t, facts.HasServices)
-		facts, err = ParseJobMessage(jobMessageLine + `{"jobContainer": null, "steps": []}`)
+		facts, err = parseJobMessage(jobMessageLine + `{"jobContainer": null, "steps": []}`)
 		require.NoError(t, err)
 		assert.False(t, facts.HasContainer)
 		assert.False(t, facts.HasServices)
 	})
 	t.Run("verify when a step continues on error then a literal true or an expression counts and a literal false or none does not", func(t *testing.T) {
-		facts, err := ParseJobMessage(jobMessageLine + `{"steps": [
+		facts, err := parseJobMessage(jobMessageLine + `{"steps": [
  {"reference": {"type": "script"}, "continueOnError": {"type": 3, "bool": true}},
  {"reference": {"type": "script"}, "continueOnError": {"type": 3, "expr": "matrix.os == 'x'"}},
  {"reference": {"type": "script"}, "continueOnError": {"type": 3, "bool": false}},
@@ -181,7 +181,7 @@ func TestParseJobMessage(t *testing.T) {
 	})
 	t.Run("verify when there is no job message then it fails", func(t *testing.T) {
 		for _, content := range []string{"", "[x INFO Worker] Version: 1\n", jobMessageLine + "no json here", jobMessageLine + `{"steps": [`} {
-			_, err := ParseJobMessage(content)
+			_, err := parseJobMessage(content)
 			assert.Error(t, err, "content %q", content)
 		}
 	})
@@ -225,7 +225,6 @@ func TestReadRunnerDiagJobMessage(t *testing.T) {
 		snap, err := ReadRunnerDiag(dir, testRun, testNow)
 		require.NoError(t, err)
 		assert.True(t, snap.Planted)
-		assert.ElementsMatch(t, []string{"Worker_20261005-050700-utc.log", "Worker_20261005-050701-utc.log"}, snap.PlantedFiles)
 	})
 	t.Run("verify when the job's own log is the newest then it is not planted", func(t *testing.T) {
 		dir := writeDiag(t, map[string]string{
@@ -235,7 +234,6 @@ func TestReadRunnerDiagJobMessage(t *testing.T) {
 		snap, err := ReadRunnerDiag(dir, testRun, testNow)
 		require.NoError(t, err)
 		assert.False(t, snap.Planted)
-		assert.Empty(t, snap.PlantedFiles)
 	})
 	t.Run("verify when buffers of other jobs sit in pages and blocks then only this job's timeline is read", func(t *testing.T) {
 		dir := writeDiag(t, map[string]string{

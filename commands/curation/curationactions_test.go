@@ -1148,7 +1148,7 @@ func TestCurationActionsCommand_Run_MixedOutcomes(t *testing.T) {
 		assert.Equal(t, 1, strings.Count(report, "| Approved |"), report)
 		assert.Equal(t, 1, strings.Count(report, "| Rejected |"), report)
 		assert.Equal(t, 1, strings.Count(report, "| Undetermined |"), report)
-		assert.ErrorContains(t, err, `evil-org/backdoor@v1: status "Rejected"`)
+		assert.ErrorContains(t, err, `"evil-org/backdoor@v1": status "Rejected"`)
 		assert.ErrorContains(t, err, "flaky-org/remote@v1")
 		assert.ErrorContains(t, err, "decision service unavailable")
 		assert.NotContains(t, err.Error(), `status "Undetermined"`, "an Undetermined action is explained once, by its cause")
@@ -1162,7 +1162,7 @@ func TestCurationActionsCommand_Run_MixedOutcomes(t *testing.T) {
 
 		require.Error(t, err, "only an explicit Approved may clear the gate")
 		assert.Equal(t, 1, strings.Count(report, "| Undetermined |"), report)
-		assert.ErrorContains(t, err, `quiet-org/action@v1: status "Undetermined"`)
+		assert.ErrorContains(t, err, `"quiet-org/action@v1": status "Undetermined"`)
 	})
 }
 
@@ -1328,4 +1328,16 @@ func TestCurationActionsCommand_Run_AttributesOnlyFromTheCommitBeingRun(t *testi
 			assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
 		})
 	}
+}
+
+func TestNotApprovedErrorQuotesWhatItRepeats(t *testing.T) {
+	// The action and ref of an unpaired row, and an Undetermined row's Notes, can carry text read from
+	// the runner's logs; on stdout a line starting with :: is a workflow command.
+	err := notApprovedError([]githubactions.ActionReportRow{
+		{Action: "evil/x\n::error::a", Ref: "v1\r\n::error::b", Status: string(githubactions.ActionRejected), Notes: "n\n::error::c"},
+	})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "\n::error::")
+	assert.NotContains(t, err.Error(), "\r")
+	assert.Contains(t, err.Error(), `"evil/x::error::a@v1::error::b": status "Rejected" - "n::error::c"`)
 }

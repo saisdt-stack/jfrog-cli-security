@@ -42,5 +42,5 @@ func inspectProc(pid int) (processInfo, error) {
 	}
 	// The kernel appends this when the binary was replaced on disk after the process started, as on a
 	// runner self-update.
-	return processInfo{PID: pid, ParentPID: ppid, Exe: strings.TrimSuffix(exe, " (deleted)")}, nil
+	return processInfo{ParentPID: ppid, Exe: strings.TrimSuffix(exe, " (deleted)")}, nil
 }

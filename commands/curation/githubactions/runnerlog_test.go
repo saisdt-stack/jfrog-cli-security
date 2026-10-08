@@ -26,6 +26,18 @@ func TestParseSetupJobLines(t *testing.T) {
 	}, ParseSetupJobLines(text))
 }
 
+func TestParseSetupJobLinesNeverSpanALine(t *testing.T) {
+	// The setup line is matched anywhere on a line, so a name broken across lines must not let one
+	// capture carry a newline, and with it a workflow command, into what is printed.
+	for _, text := range []string{
+		"Download action repository 'actions/checkout@v4\n::error::forged' (SHA:" + shaV4 + ")\n",
+		"Download action repository 'actions/check\r\n::error::out@v4' (SHA:" + shaV4 + ")\n",
+		"Download action repository 'act\nions/checkout@v4' (SHA:" + shaV4 + ")\n",
+	} {
+		assert.Empty(t, ParseSetupJobLines(text), "ParseSetupJobLines(%q)", text)
+	}
+}
+
 // workerLine returns message as the runner writes it into the Worker log.
 func workerLine(message string) string {
 	return "[2026-10-07 11:03:03Z INFO ActionManager] " + message + "\n"

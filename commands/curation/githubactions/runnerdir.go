@@ -26,8 +26,8 @@ const maxProcessHops = 32
 
 // processInfo is one process as the walk sees it.
 type processInfo struct {
-	PID, ParentPID int
-	Exe            string
+	ParentPID int
+	Exe       string
 }
 
 // inspector reads one process.
@@ -44,18 +44,14 @@ func DetectRunnerDir() (string, error) {
 		}
 		return "", fmt.Errorf("%w: %w", ErrRunnerNotVisible, err)
 	}
-	return FindRunnerDir(os.Getpid(), inspect)
+	return findRunnerDir(os.Getpid(), inspect, isRunnerDir)
 }
 
-// FindRunnerDir walks the parent chain from pid until it reaches Runner.Worker and returns the runner
-// directory: the parent of the folder that holds the Worker binary ("bin"). Every failure wraps
-// ErrRunnerNotVisible, as do DetectRunnerDir's.
-func FindRunnerDir(pid int, inspect inspector) (string, error) {
-	return findRunnerDir(pid, inspect, isRunnerDir)
-}
-
-// findRunnerDir is FindRunnerDir with the directory check passed in, so a test can name hosted paths
-// that do not exist on its machine. A process whose exe is not the Worker only leads to its parent.
+// findRunnerDir walks the parent chain from pid until it reaches Runner.Worker and returns the runner
+// directory: the parent of the folder that holds the Worker binary ("bin"), accepted only when
+// isRunnerDir says so. Every failure wraps ErrRunnerNotVisible. A process whose exe is not the Worker
+// only leads to its parent. The check is passed in so a test can name hosted paths that do not exist
+// on its machine.
 func findRunnerDir(pid int, inspect inspector, isRunnerDir func(dir string) bool) (string, error) {
 	for range maxProcessHops {
 		if pid <= 1 {

@@ -67,12 +67,13 @@ type ActionRef struct {
 	// Verification is how the decider checks this action; the zero value compares content.
 	Verification Verification
 	// ContentReason is why Verification is VerifyContent although the runner's log named a commit:
-	// a short fixed code (log-untrusted, first-step, no-sha, cache-source, renamed, stale-line),
+	// a short fixed code (log-untrusted, no-sha, cache-source, renamed, stale-line),
 	// never log text. "" when there is nothing to explain.
 	ContentReason string
-	// LoggedSHAs is, for a ref the runner's logs gave no SHA in a job whose logs are trusted, every
-	// commit the Worker log names for this repository (lower case): the decider pairs the ref with
-	// one of them through the repository's refs list, without reading the folder. nil otherwise.
+	// LoggedSHAs is, for a ref the runner's logs gave no SHA in a job whose logs are trusted, the
+	// commits the Worker log names for this repository (lower case) that no evidence rule downgraded
+	// and no other folder holds: the decider pairs the ref with one of them through the repository's
+	// refs list, without reading the folder. nil otherwise.
 	LoggedSHAs []string
 }
 

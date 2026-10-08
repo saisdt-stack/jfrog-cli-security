@@ -667,20 +667,28 @@ const (
 	curateAsStep curationActionsRunMode = iota
 	curateAsHook
 	curateFromPre
+	curateFromPost
 	installHook
 	uninstallHook
 )
 
 // curationActionsMode picks what one invocation of curate-gh-actions does from its flags.
 // --trust-action-cache only means something to the hook, so it is accepted only when installing the
-// hook, which pins it into the hook script, and when running as the hook. --from-pre finds the runner
-// itself, from the step's process tree, so it takes no runner flag.
-func curationActionsMode(runnerHook, install, uninstall, fromPre, trustActionCache bool, runnerDir string) (curationActionsRunMode, error) {
+// hook, which pins it into the hook script, and when running as the hook. --from-pre and --from-post
+// find the runner themselves, from the step's process tree, so they take no runner flag.
+func curationActionsMode(runnerHook, install, uninstall, fromPre, fromPost, trustActionCache bool, runnerDir string) (curationActionsRunMode, error) {
 	set := 0
 	for _, b := range []bool{runnerHook, install, uninstall} {
 		if b {
 			set++
 		}
+	}
+	if fromPost {
+		if set > 0 || fromPre || trustActionCache || runnerDir != "" {
+			return curateAsStep, errorutils.CheckErrorf("--%s cannot be set with --%s, --%s, --%s, --%s, --%s or --%s",
+				flags.FromPost, flags.FromPre, flags.RunnerDir, flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook, flags.TrustActionCache)
+		}
+		return curateFromPost, nil
 	}
 	if fromPre && (set > 0 || runnerDir != "") {
 		return curateAsStep, errorutils.CheckErrorf("--%s cannot be set with --%s, --%s, --%s or --%s",
@@ -716,7 +724,8 @@ func curationActionsMode(runnerHook, install, uninstall, fromPre, trustActionCac
 func CurationActionsCmd(c *components.Context) error {
 	runnerDir := c.GetStringFlagValue(flags.RunnerDir)
 	mode, err := curationActionsMode(c.GetBoolFlagValue(flags.RunnerHook), c.GetBoolFlagValue(flags.InstallRunnerHook),
-		c.GetBoolFlagValue(flags.UninstallRunnerHook), c.GetBoolFlagValue(flags.FromPre), c.GetBoolFlagValue(flags.TrustActionCache), runnerDir)
+		c.GetBoolFlagValue(flags.UninstallRunnerHook), c.GetBoolFlagValue(flags.FromPre), c.GetBoolFlagValue(flags.FromPost),
+		c.GetBoolFlagValue(flags.TrustActionCache), runnerDir)
 	if err != nil {
 		return err
 	}
@@ -729,7 +738,7 @@ func CurationActionsCmd(c *components.Context) error {
 		}
 		log.Info("Removed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
 		return nil
-	default: // curateAsStep, curateAsHook, curateFromPre
+	default: // curateAsStep, curateAsHook, curateFromPre, curateFromPost
 		threads, err := pluginsCommon.GetThreadsCount(c)
 		if err != nil {
 			return err
@@ -745,7 +754,7 @@ func CurationActionsCmd(c *components.Context) error {
 		if mode == curateAsHook {
 			cmd.SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "").SetTrustActionCache(c.GetBoolFlagValue(flags.TrustActionCache))
 		}
-		cmd.SetFromPre(mode == curateFromPre)
+		cmd.SetFromPre(mode == curateFromPre).SetFromPost(mode == curateFromPost)
 		return cmd.Run()
 	}
 }

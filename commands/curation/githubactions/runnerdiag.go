@@ -50,10 +50,8 @@ type DiagSnapshot struct {
 	JobParsed bool
 	// Planted is true when Worker logs newer than the one holding the job message were read: the
 	// runner starts one Worker per job, so a newer file without a job message is either a rollover
-	// of this job's log or a file a job planted, and the two cannot be told apart. PlantedFiles
-	// names those newer files.
-	Planted      bool
-	PlantedFiles []string
+	// of this job's log or a file a job planted, and the two cannot be told apart.
+	Planted bool
 	// SetupBufferUnfiltered is true when the setup buffer could not be limited to this job's
 	// timeline because the job message names none, so it may hold another job's lines.
 	SetupBufferUnfiltered bool
@@ -149,7 +147,6 @@ func ReadRunnerDiag(runnerDir string, run RunIdentity, now time.Time) (DiagSnaps
 	}
 	if len(picked) > 1 {
 		snap.Planted = true
-		snap.PlantedFiles = slices.Clone(picked[:len(picked)-1])
 	}
 	slices.Reverse(picked)
 	slices.Reverse(contents)
@@ -175,7 +172,7 @@ func ReadRunnerDiag(runnerDir string, run RunIdentity, now time.Time) (DiagSnaps
 			continue // uploaded and deleted between the listing and the read
 		}
 		if err != nil {
-			log.Warn(fmt.Sprintf("Skipping the runner's setup buffer %q, which cannot be read: %v", path, err))
+			log.Warn(fmt.Sprintf("Skipping the runner's setup buffer %q, which cannot be read: %s", path, QuoteForLog(err.Error())))
 			continue
 		}
 		setup.Write(content)
@@ -213,6 +210,15 @@ type JobFacts struct {
 	TimelineID   string // timeline.id; "" when absent
 }
 
+// FirstStepContinuesOnError reports whether the job's first step runs the action self (owner/repo) with
+// continue-on-error, and whether it runs self at all: in a pre, the step that runs the command.
+func (j JobFacts) FirstStepContinuesOnError(self string) (continues, found bool) {
+	if self == "" || len(j.Steps) == 0 || !isRemoteStep(j.Steps[0], self) {
+		return false, false
+	}
+	return j.Steps[0].ContinueOnError, true
+}
+
 // jobMessage is the job message a Worker logs, decoded once. Fields stay raw so a malformed one costs
 // only its own facts, not the run identity. encoding/json matches the field names case-insensitively.
 type jobMessage struct {
@@ -246,9 +252,9 @@ func decodeJobMessage(content string) (jobMessage, error) {
 	return m, nil
 }
 
-// ParseJobMessage reads the job's steps, container, services and timeline from the job message in a
+// parseJobMessage reads the job's steps, container, services and timeline from the job message in a
 // Worker log's text.
-func ParseJobMessage(content string) (JobFacts, error) {
+func parseJobMessage(content string) (JobFacts, error) {
 	m, err := decodeJobMessage(content)
 	if err != nil {
 		return JobFacts{}, err

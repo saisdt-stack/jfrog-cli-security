@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jfrog/jfrog-client-go/utils/errorutils"
 	"github.com/jfrog/jfrog-client-go/utils/log"
 
 	"github.com/jfrog/jfrog-cli-security/commands/curation/githubactions"
@@ -64,17 +63,36 @@ type runnerLogDiscoverer struct {
 	// trustActionCache is the admin's --trust-action-cache: every action loaded from the runner's
 	// archive or symlink cache is trusted as if that cache were read-only to the job.
 	trustActionCache bool
+	// seen, when set, receives what the logs said about the job, so the caller need not read them a
+	// second time; left zero when the logs cannot be read.
+	seen *jobSeen
+}
+
+// jobSeen is what reading the runner's logs told about the job beyond its actions.
+type jobSeen struct {
+	// facts is what the job message says about the job.
+	facts githubactions.JobFacts
+	// logsTrusted is true when the trust assessment let the logs decide actions by their SHA.
+	logsTrusted bool
 }
 
 func (d runnerLogDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 	// First, before anything slow: the runner deletes the "Set up job" buffer seconds after the hook
 	// starts.
 	snapshot, diagErr := githubactions.ReadRunnerDiag(d.runnerDir, githubactions.RunIdentityFromEnv(), time.Now())
+	seen := d.seen
+	if seen == nil {
+		seen = &jobSeen{}
+	}
+	if diagErr == nil {
+		seen.facts = snapshot.Job
+	}
 	if diagErr == nil {
 		if refs, ok := githubactions.RefsFromSetupJob(snapshot.SetupJob, snapshot.Worker, d.actionsCacheDir); ok {
 			// Every action has its ref and SHA from the runner itself, so the cache has nothing left to
 			// tell - provided the logs can be trusted. If not, the refs come from the folders on disk.
 			if assessment := d.assess(refs, snapshot); assessment.JobTrusted {
+				seen.logsTrusted = true
 				d.markVerification(refs, snapshot, assessment)
 				return append(refs, unpairedCommits(refs, snapshot.Worker)...), nil
 			}
@@ -99,21 +117,31 @@ func (d runnerLogDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 		return walked, nil
 	}
 	refs, unplaced := githubactions.AttachRunnerProvenance(walked, snapshot.SetupJob, snapshot.Worker)
-	var missing []string
+	warnFolderless(walked, unplaced)
+	assessment := d.assess(refs, snapshot)
+	seen.logsTrusted = assessment.JobTrusted
+	d.markVerification(refs, snapshot, assessment)
+	return append(refs, unpairedCommits(refs, snapshot.Worker)...), nil
+}
+
+// warnFolderless warns once, naming each quoted, about the Worker-logged commits whose repository has
+// no folder in the action cache: a repository renamed or transferred since the workflow named it, or a
+// Worker line forged through a remote composite's docker:// image. Neither is an error, since
+// unpairedCommits decides each such commit by its SHA and every folder is decided on its own.
+func warnFolderless(walked []githubactions.ActionRef, unplaced []githubactions.WorkerAction) {
+	var folderless []string
 	for _, w := range unplaced {
 		inCache := slices.ContainsFunc(walked, func(r githubactions.ActionRef) bool {
-			return strings.EqualFold(r.Owner+"/"+r.Repo, w.Owner+"/"+w.Repo)
+			return strings.EqualFold(r.Owner, w.Owner) && strings.EqualFold(r.Repo, w.Repo)
 		})
 		if !inCache {
-			missing = append(missing, w.Owner+"/"+w.Repo+"@"+w.SHA)
+			folderless = append(folderless, githubactions.QuoteForLog(w.Owner+"/"+w.Repo+"@"+w.SHA))
 		}
 	}
-	if len(missing) > 0 {
-		return nil, errorutils.CheckErrorf("the runner fetched actions that are not in its action cache, so this job cannot be "+
-			"reported as curated: %s", strings.Join(missing, ", "))
+	if len(folderless) > 0 {
+		log.Warn("The runner's logs name commits of repositories with no folder in the action cache (renamed or transferred, " +
+			"or a forged log line); each is decided by its SHA: " + strings.Join(folderless, ", "))
 	}
-	d.markVerification(refs, snapshot, d.assess(refs, snapshot))
-	return append(refs, unpairedCommits(refs, snapshot.Worker)...), nil
 }
 
 // unpairedCommits returns, as refs decided by their SHA, the Worker-logged commits no ref holds under
@@ -158,12 +186,16 @@ func (d runnerLogDiscoverer) trustedCache(a githubactions.WorkerAction) bool {
 // no evidence rule downgraded that action; every other ref is compared by content, with a reason code
 // for its Notes. A ref paired with a SHA the Worker logged under another name is compared too: names
 // alone cannot tell a renamed repository from a setup line handing one action another's approved SHA.
+//
+// Every downgrade is warned about once per job: the job-level reasons when the logs are not trusted,
+// otherwise each downgraded action with its code.
 func (d runnerLogDiscoverer) markVerification(refs []githubactions.ActionRef, snapshot githubactions.DiagSnapshot,
 	assessment githubactions.LogAssessment) {
 	if !assessment.JobTrusted {
 		log.Warn("The runner's logs cannot be trusted for this job, so every action is verified by content instead of by the SHA " +
 			"the runner logged: " + strings.Join(assessment.JobReasons, "; "))
 	}
+	var downgraded []string
 	for i := range refs {
 		r := &refs[i]
 		code := assessment.ActionReason[githubactions.AssessmentKey(r.Owner, r.Repo, r.RunnerSHA)]
@@ -171,7 +203,7 @@ func (d runnerLogDiscoverer) markVerification(refs []githubactions.ActionRef, sn
 		case r.RunnerSHA == "":
 			r.ContentReason = githubactions.ReasonNoSHA
 			if assessment.JobTrusted {
-				r.LoggedSHAs = loggedSHAs(snapshot.Worker, r.Owner, r.Repo)
+				r.LoggedSHAs = pairableSHAs(refs, snapshot.Worker, assessment, r.Owner, r.Repo)
 			}
 		case !assessment.JobTrusted:
 			r.ContentReason = githubactions.ReasonLogUntrusted
@@ -183,19 +215,34 @@ func (d runnerLogDiscoverer) markVerification(refs []githubactions.ActionRef, sn
 			r.Verification = githubactions.VerifyLoggedSHA
 			continue
 		}
-		log.Debug(fmt.Sprintf("github-actions curation: %s is verified by content: %s",
-			githubactions.QuoteForLog(r.Owner+"/"+r.Repo), r.ContentReason))
+		if assessment.JobTrusted {
+			downgraded = append(downgraded, githubactions.QuoteForLog(r.Owner+"/"+r.Repo+"@"+r.Ref)+": "+r.ContentReason)
+		}
+	}
+	if len(downgraded) > 0 {
+		log.Warn("These actions are verified by content instead of by the SHA the runner logged: " + strings.Join(downgraded, ", "))
 	}
 }
 
-// loggedSHAs returns the distinct commits, lower-cased, the Worker log names for owner/repo.
-func loggedSHAs(worker []githubactions.WorkerAction, owner, repo string) []string {
+// pairableSHAs returns the distinct commits, lower-cased, the Worker log names for owner/repo that the
+// refs list may pair a folder with. A commit an evidence rule downgraded is left out, or the refs list
+// would decide a possibly poisoned cache entry by its SHA; so is one another folder of the repository
+// already holds, which cannot also be this folder's.
+func pairableSHAs(refs []githubactions.ActionRef, worker []githubactions.WorkerAction, assessment githubactions.LogAssessment,
+	owner, repo string) []string {
+	held := func(sha string) bool {
+		return slices.ContainsFunc(refs, func(r githubactions.ActionRef) bool {
+			return strings.EqualFold(r.Owner, owner) && strings.EqualFold(r.Repo, repo) && strings.EqualFold(r.RunnerSHA, sha)
+		})
+	}
 	var shas []string
 	for _, w := range worker {
 		sha := strings.ToLower(w.SHA)
-		if strings.EqualFold(w.Owner, owner) && strings.EqualFold(w.Repo, repo) && !slices.Contains(shas, sha) {
-			shas = append(shas, sha)
+		if !strings.EqualFold(w.Owner, owner) || !strings.EqualFold(w.Repo, repo) || slices.Contains(shas, sha) ||
+			assessment.ActionReason[githubactions.AssessmentKey(owner, repo, sha)] != "" || held(sha) {
+			continue
 		}
+		shas = append(shas, sha)
 	}
 	return shas
 }

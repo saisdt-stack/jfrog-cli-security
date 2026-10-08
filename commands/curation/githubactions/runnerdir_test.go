@@ -27,10 +27,10 @@ func (f fakeProcesses) inspect(pid int) (processInfo, error) {
 // the Worker (80), whose own parent is the Listener (70).
 func preChain(workerExe string) fakeProcesses {
 	return fakeProcesses{
-		100: {PID: 100, ParentPID: 90, Exe: "/opt/jf"},
-		90:  {PID: 90, ParentPID: 80, Exe: "/opt/node20/bin/node"},
-		80:  {PID: 80, ParentPID: 70, Exe: workerExe},
-		70:  {PID: 70, ParentPID: 1, Exe: "/opt/runner/bin/Runner.Listener"},
+		100: {ParentPID: 90, Exe: "/opt/jf"},
+		90:  {ParentPID: 80, Exe: "/opt/node20/bin/node"},
+		80:  {ParentPID: 70, Exe: workerExe},
+		70:  {ParentPID: 1, Exe: "/opt/runner/bin/Runner.Listener"},
 	}
 }
 
@@ -80,20 +80,20 @@ func TestFindRunnerDirNotVisible(t *testing.T) {
 	t.Run("verify when the chain reaches pid 1 without a Worker then the runner is not visible", func(t *testing.T) {
 		// A container job: the action's node is started by the container's init, not by the Worker.
 		chain := fakeProcesses{
-			100: {PID: 100, ParentPID: 90, Exe: "/usr/local/bin/jf"},
-			90:  {PID: 90, ParentPID: 1, Exe: "/__e/node20/bin/node"},
+			100: {ParentPID: 90, Exe: "/usr/local/bin/jf"},
+			90:  {ParentPID: 1, Exe: "/__e/node20/bin/node"},
 		}
 		_, err := findRunnerDir(100, chain.inspect, accept)
 		assert.ErrorIs(t, err, ErrRunnerNotVisible)
 	})
 	t.Run("verify when a process of the chain cannot be read then the runner is not visible", func(t *testing.T) {
-		_, err := findRunnerDir(100, fakeProcesses{100: {PID: 100, ParentPID: 90, Exe: "/opt/jf"}}.inspect, accept)
+		_, err := findRunnerDir(100, fakeProcesses{100: {ParentPID: 90, Exe: "/opt/jf"}}.inspect, accept)
 		assert.ErrorIs(t, err, ErrRunnerNotVisible)
 	})
 	t.Run("verify when the chain loops then the walk gives up", func(t *testing.T) {
 		chain := fakeProcesses{
-			100: {PID: 100, ParentPID: 90, Exe: "/opt/jf"},
-			90:  {PID: 90, ParentPID: 100, Exe: "/opt/node"},
+			100: {ParentPID: 90, Exe: "/opt/jf"},
+			90:  {ParentPID: 100, Exe: "/opt/node"},
 		}
 		_, err := findRunnerDir(100, chain.inspect, accept)
 		assert.ErrorIs(t, err, ErrRunnerNotVisible)
@@ -125,13 +125,13 @@ func workerLayout(t *testing.T, withDiag bool) (runnerDir, workerExe string) {
 func TestFindRunnerDirChecksTheDirectory(t *testing.T) {
 	t.Run("verify when the runner dir holds the Worker binary and _diag then it is returned", func(t *testing.T) {
 		runnerDir, workerExe := workerLayout(t, true)
-		got, err := FindRunnerDir(100, preChain(workerExe).inspect)
+		got, err := findRunnerDir(100, preChain(workerExe).inspect, isRunnerDir)
 		require.NoError(t, err)
 		assert.Equal(t, runnerDir, got)
 	})
 	t.Run("verify when the runner dir has no _diag then it is refused", func(t *testing.T) {
 		_, workerExe := workerLayout(t, false)
-		_, err := FindRunnerDir(100, preChain(workerExe).inspect)
+		_, err := findRunnerDir(100, preChain(workerExe).inspect, isRunnerDir)
 		assert.ErrorIs(t, err, ErrRunnerNotVisible)
 	})
 }
@@ -149,7 +149,6 @@ func TestInspectorReadsThisProcess(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, filepath.IsAbs(got.Exe), "inspect(self).Exe = %q, want an absolute path", got.Exe)
 	assert.Equal(t, os.Getppid(), got.ParentPID)
-	assert.Equal(t, os.Getpid(), got.PID)
 	assert.True(t, strings.EqualFold(filepath.Base(exe), filepath.Base(got.Exe)), "inspect(self).Exe = %q, want the test binary %q", got.Exe, exe)
 	_, err = inspect(1 << 30)
 	assert.Error(t, err, "a pid no process has must not read as a process")

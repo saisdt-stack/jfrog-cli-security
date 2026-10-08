@@ -176,13 +176,23 @@ func TestRunnerLogDiscoverer(t *testing.T) {
 		assert.Equal(t, githubactions.ReasonLogUntrusted, refs[0].ContentReason)
 		assert.Equal(t, 1, strings.Count(out, "[Warn]"), "one warning carries the error: %s", out)
 	})
-	t.Run("verify when the runner fetched an action that is not in the cache then it fails", func(t *testing.T) {
+	t.Run("verify when the runner fetched an action that is not in the cache then its commit is decided by SHA", func(t *testing.T) {
+		// A renamed repository with no setup line, or a Worker line a remote composite's docker://
+		// image forged: either way the commit is decided by its SHA and every folder by its own.
 		runnerDir, cacheDir := hookRunner(t, map[string]string{
 			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4) + save("setup-node", testShaV3),
 		}, []string{"actions/checkout/v4"})
-		_, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "actions/setup-node@"+testShaV3)
+		var refs []githubactions.ActionRef
+		out := captureLog(t, log.INFO, func() {
+			var err error
+			refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
+			require.NoError(t, err)
+		})
+		assert.Equal(t, map[string]refFacts{
+			"actions/checkout@v4":             {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+			"actions/setup-node#" + testShaV3: {SHA: testShaV3, BySHA: true},
+		}, factsOf(refs))
+		assert.Contains(t, out, `"actions/setup-node@`+testShaV3+`"`, "one warning names the commit, quoted: %s", out)
 	})
 	t.Run("verify when a ref cannot be recovered then it is still curated without a runner SHA", func(t *testing.T) {
 		runnerDir, cacheDir := hookRunner(t, map[string]string{
@@ -538,6 +548,18 @@ func TestRunnerLogDiscovererLoggedSHAsOfARefWithoutARunnerSHA(t *testing.T) {
 			},
 		},
 		{
+			name: "verify when a logged commit came from a writable cache on a self-hosted runner then no ref is paired with it through the refs list",
+			extra: map[string]string{"Worker_20261005-050652-utc.log": workerStart + cachedLine("actions", "checkout", testShaV4) +
+				savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode)},
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
 			name:  "verify when the job is untrusted then no ref carries logged commits",
 			extra: map[string]string{plantedWorkerLog: "[x INFO Worker] continued\n"},
 			want: map[string]refFacts{
@@ -561,6 +583,28 @@ func TestRunnerLogDiscovererLoggedSHAsOfARefWithoutARunnerSHA(t *testing.T) {
 			assert.Equal(t, tt.want, factsOf(refs))
 		})
 	}
+}
+
+func TestRunnerLogDiscovererLoggedSHAsLeaveOutACommitPairedWithAnotherFolder(t *testing.T) {
+	// The setup line pairs v4 with its commit; main and v3 are of one age and stay unpaired, so only
+	// the commit no folder holds is left for the refs list to pair them with.
+	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout"), map[string]string{
+		"pages/a_1.log": setupLine("actions", "checkout", "v4", testShaV4),
+		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
+			savedLine("actions", "checkout", testShaV3),
+	}, []string{"actions/checkout/v4", "actions/checkout/v3", "actions/checkout/main"})
+	same := time.Now()
+	for _, ref := range []string{"v3", "main"} {
+		require.NoError(t, os.Chtimes(filepath.Join(cacheDir, "actions", "checkout", ref+".completed"), same, same))
+	}
+	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
+	require.NoError(t, err)
+	assert.Equal(t, map[string]refFacts{
+		"actions/checkout@v4":           {SHA: testShaV4, BySHA: true},
+		"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+		"actions/checkout@main":         {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+		"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+	}, factsOf(refs))
 }
 
 func TestRunnerLogDiscovererAmbiguousPairLeavesOnlyThatActionOnContent(t *testing.T) {
@@ -661,7 +705,7 @@ func TestRunnerLogDiscovererCacheSourceOnSelfHostedDowngradesThatActionOnly(t *t
 			savedLine("actions", "setup-node", testShaNode),
 	}, []string{"actions/checkout/v4", "actions/setup-node/v4"})
 	var refs []githubactions.ActionRef
-	out := captureLog(t, log.DEBUG, func() {
+	out := captureLog(t, log.INFO, func() {
 		var err error
 		refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
 		require.NoError(t, err)
@@ -671,12 +715,14 @@ func TestRunnerLogDiscovererCacheSourceOnSelfHostedDowngradesThatActionOnly(t *t
 		"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
 	}, factsOf(refs))
 	assert.NotContains(t, out, "cannot be trusted", "an evidence rule downgrades the action, not the job")
-	assert.Contains(t, out, `"actions/checkout"`)
-	assert.Contains(t, out, githubactions.ReasonCacheSource)
+	assert.Equal(t, 1, strings.Count(out, "[Warn]"), "one warning names every downgraded action: %s", out)
+	assert.Contains(t, out, `"actions/checkout@v4": `+githubactions.ReasonCacheSource)
+	assert.NotContains(t, out, "setup-node")
 }
 
 // checkoutArchiveCache is an archive cache holding actions/checkout at testShaV4, made read-only by
-// its owner, the user running the test, when readOnly is set. Write permission is restored on cleanup so the temp dir can be removed.
+// its owner, the user running the test, when readOnly is set. Write permission is restored on cleanup
+// so the temp dir can be removed.
 func checkoutArchiveCache(t *testing.T, readOnly bool) string {
 	t.Helper()
 	root := t.TempDir()
@@ -785,7 +831,7 @@ func TestRunnerLogDiscovererDecidesEveryLoggedCommitUnderItsOwnName(t *testing.T
 			cacheDirs: []string{"aa/aa/v1", "actions/checkout/v4", "actions/checkout/v3"},
 			want: map[string]refFacts{
 				"aa/aa@v1":                      {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
-				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4}},
 				"actions/checkout@v3":           {SHA: testShaV3, BySHA: true},
 				"aa/aa#" + testShaEvil:          {SHA: testShaEvil, BySHA: true},
 				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},

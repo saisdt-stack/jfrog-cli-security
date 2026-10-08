@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -40,6 +41,7 @@ type CurationActionsCommand struct {
 	githubHosted     bool
 	trustActionCache bool
 	fromPre          bool
+	fromPost         bool
 	// runnerDirFinder walks the process tree to the runner under --from-pre; a test sets a fake, since
 	// on a GitHub runner the test process itself descends from the Worker. nil finds no runner.
 	runnerDirFinder func() (string, error)
@@ -151,14 +153,15 @@ func (c *CurationActionsCommand) SetFromPre(fromPre bool) *CurationActionsComman
 	return c
 }
 
-// discovererFor returns the discoverer Run uses for actionsCacheDir.
-func (c *CurationActionsCommand) discovererFor(actionsCacheDir string) (actionDiscoverer, error) {
+// discovererFor returns the discoverer Run uses for actionsCacheDir. One that reads the runner's logs
+// fills seen with what the logs said about the job.
+func (c *CurationActionsCommand) discovererFor(actionsCacheDir string, seen *jobSeen) (actionDiscoverer, error) {
 	switch {
 	case c.discoverer != nil:
 		return c.discoverer, nil
 	case c.readsRunnerLogs() && c.runnerDir != "":
 		return runnerLogDiscoverer{runnerDir: c.runnerDir, actionsCacheDir: actionsCacheDir, mode: c.callerMode, self: c.self,
-			githubHosted: c.githubHosted, trustActionCache: c.trustActionCache}, nil
+			githubHosted: c.githubHosted, trustActionCache: c.trustActionCache, seen: seen}, nil
 	case c.callerMode == githubactions.ModePre:
 		// A pre that could not find the runner: no log names a SHA, so every action is compared by content.
 		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir, contentReason: githubactions.ReasonNoSHA}, nil
@@ -189,6 +192,9 @@ func (c *CurationActionsCommand) Run() (err error) {
 	// curation cannot reach a verdict - a timeout, or a decision service that is unreachable.
 	// That setting is not fetched or honoured yet, so this command is unconditionally fail-closed.
 	ctx := context.Background()
+	if c.fromPost {
+		return c.runPost(ctx)
+	}
 
 	workingDir := c.workingDir
 	if workingDir == "" {
@@ -207,13 +213,16 @@ func (c *CurationActionsCommand) Run() (err error) {
 	if c.fromPre {
 		c.locateRunnerFromPre()
 	}
-	discoverer, err := c.discovererFor(actionsCacheDir)
+	var seen jobSeen
+	defer func() {
+		if err != nil {
+			c.warnFailureMaySwallow(seen.facts)
+		}
+	}()
+	discovered, err := c.discover(actionsCacheDir, &seen)
 	if err != nil {
-		return err
-	}
-	discovered, err := discoverer.Discover()
-	if err != nil {
-		return err
+		// Nothing was listed, so nothing can be told apart: every folder goes.
+		return errors.Join(err, c.neutralizeAll(actionsCacheDir))
 	}
 
 	var used githubactions.JobUses
@@ -230,22 +239,25 @@ func (c *CurationActionsCommand) Run() (err error) {
 	if attributed {
 		discovered, localUses = githubactions.CrossReference(discovered, used)
 	}
-	artifactoryVcsRepo, err := c.resolveArtifactoryVcsRepo(ctx)
+	artifactoryVcsRepo, decider, err := c.resolveDecision(ctx)
 	if err != nil {
-		return err
-	}
-
-	decider, err := c.resolveDecider()
-	if err != nil {
-		return err
+		// No verdict was reached for any action, so none may run.
+		return errors.Join(err, c.neutralize(actionsCacheDir, discovered, discovered))
 	}
 	outcome := c.decideAll(ctx, decider, artifactoryVcsRepo, discovered)
 	if outcome.accessErr != nil {
 		// Nothing is reported: the run stopped part-way, and a table of mostly-skipped actions
-		// would read as a verdict when none was reached.
-		return outcome.accessErr
+		// would read as a verdict when none was reached. No action was approved, so none may run.
+		return errors.Join(outcome.accessErr, c.neutralize(actionsCacheDir, discovered, discovered))
 	}
 	rows := outcome.rows
+	neutralizeErr := c.neutralize(actionsCacheDir, discovered, notApprovedRefs(discovered, rows))
+	if c.callerMode == githubactions.ModePre {
+		// Not a curation failure: without the saved set the post decides every logged action again.
+		if saveErr := saveDecided(discovered, seen.logsTrusted); saveErr != nil {
+			log.Warn(fmt.Sprintf("Cannot hand the actions decided here to this action's post, so it will decide every action the runner logged: %v", saveErr))
+		}
+	}
 
 	curated := curatedActions(rows, attributed, localUses)
 	caveat := formats.RenderActionsException([]formats.CuratedActions{curated})
@@ -259,7 +271,109 @@ func (c *CurationActionsCommand) Run() (err error) {
 			"the curation section - the report above is the complete result: %v", recordErr))
 	}
 
-	return errors.Join(outcome.decideErr(), notApprovedError(outcome.decidedRows()))
+	return errors.Join(outcome.decideErr(), notApprovedError(outcome.decidedRows()), neutralizeErr)
+}
+
+// neutralizeAll removes every action folder, as the hook or in a pre, when the actions could not even be
+// listed: none was approved, so none may run.
+func (c *CurationActionsCommand) neutralizeAll(actionsCacheDir string) error {
+	if !c.readsRunnerLogs() {
+		return nil
+	}
+	removed, err := githubactions.NeutralizeAll(actionsCacheDir)
+	logRemoved(removed)
+	if err != nil {
+		return fmt.Errorf("removing every action from the runner's action directory: %w", err)
+	}
+	return nil
+}
+
+// warnFailureMaySwallow warns, for a pre that fails for any reason, when continue-on-error may hide that failure: our
+// step has it set, or the job message does not show our step first.
+func (c *CurationActionsCommand) warnFailureMaySwallow(job githubactions.JobFacts) {
+	if c.callerMode != githubactions.ModePre {
+		return
+	}
+	if continues, found := job.FirstStepContinuesOnError(c.self); continues || !found {
+		log.Warn("This step's failure may be swallowed (continue-on-error is set on it, or the job message does not show it as the " +
+			"job's first step): the removed action folders, not this step's exit code, are what stop the actions curation did not approve.")
+	}
+}
+
+// logRemoved warns once with every action folder removed, each quoted.
+func logRemoved(removed []string) {
+	if len(removed) == 0 {
+		return
+	}
+	quoted := make([]string, 0, len(removed))
+	for _, name := range removed {
+		quoted = append(quoted, githubactions.QuoteForLog(name))
+	}
+	log.Warn("Removed the runner's copy of the actions curation did not approve, so their steps fail when the runner loads them: " +
+		strings.Join(quoted, ", "))
+}
+
+// notApprovedRefs returns the refs whose row, at the same index, is not Approved.
+func notApprovedRefs(refs []githubactions.ActionRef, rows []githubactions.ActionReportRow) []githubactions.ActionRef {
+	var targets []githubactions.ActionRef
+	for i, row := range rows {
+		if !row.Approved() {
+			targets = append(targets, refs[i])
+		}
+	}
+	return targets
+}
+
+// neutralize removes the runner's copy of targets, as the hook or in a pre, so that their steps -
+// pre and post included - fail at load: failing this command does not stop another action's pre or
+// post, and continue-on-error on the wrapping step hides the failure. A plain step keeps the runner's
+// copy, since by then those steps have run or are gated by the step's own failure.
+//
+// A target that is an unpaired commit also takes any folder paired with that commit under another
+// name, the way a renamed repository is paired.
+func (c *CurationActionsCommand) neutralize(actionsCacheDir string, all, targets []githubactions.ActionRef) error {
+	if !c.readsRunnerLogs() || len(targets) == 0 {
+		return nil
+	}
+	for _, t := range slices.Clone(targets) {
+		if !t.Unpaired() {
+			continue
+		}
+		for _, r := range all {
+			sameCommit := r.Path != "" && strings.EqualFold(r.RunnerSHA, t.RunnerSHA)
+			if sameCommit && !slices.ContainsFunc(targets, func(o githubactions.ActionRef) bool { return o.Path == r.Path }) {
+				targets = append(targets, r)
+			}
+		}
+	}
+	removed, err := githubactions.Neutralize(actionsCacheDir, targets)
+	logRemoved(removed)
+	if err != nil {
+		return fmt.Errorf("removing the actions curation did not approve from the runner's action directory: %w", err)
+	}
+	return nil
+}
+
+// discover lists the actions to curate; a discoverer that reads the runner's logs fills seen.
+func (c *CurationActionsCommand) discover(actionsCacheDir string, seen *jobSeen) ([]githubactions.ActionRef, error) {
+	discoverer, err := c.discovererFor(actionsCacheDir, seen)
+	if err != nil {
+		return nil, err
+	}
+	return discoverer.Discover()
+}
+
+// resolveDecision returns the Artifactory VCS repository whose policies govern the job and the decider.
+func (c *CurationActionsCommand) resolveDecision(ctx context.Context) (string, githubactions.ActionCurationDecider, error) {
+	artifactoryVcsRepo, err := c.resolveArtifactoryVcsRepo(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	decider, err := c.resolveDecider()
+	if err != nil {
+		return "", nil, err
+	}
+	return artifactoryVcsRepo, decider, nil
 }
 
 // locateRunnerFromPre sets up a --from-pre run: the mode, the running action and the runner, found from
@@ -273,11 +387,7 @@ func (c *CurationActionsCommand) locateRunnerFromPre() {
 	if c.runnerDir != "" {
 		return
 	}
-	find := c.runnerDirFinder
-	if find == nil {
-		find = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
-	}
-	dir, err := find()
+	dir, err := c.findRunnerDir()
 	if err != nil {
 		log.Warn("Cannot find the runner from this step's process tree, so its logs cannot name the SHA of any action - " +
 			"curating the action cache, every action by content: " + githubactions.QuoteForLog(err.Error()))
@@ -287,18 +397,27 @@ func (c *CurationActionsCommand) locateRunnerFromPre() {
 	c.runnerDir = dir
 }
 
+// findRunnerDir walks this process's tree to the runner; with no finder the runner is not visible.
+func (c *CurationActionsCommand) findRunnerDir() (string, error) {
+	if c.runnerDirFinder == nil {
+		return "", githubactions.ErrRunnerNotVisible
+	}
+	return c.runnerDirFinder()
+}
+
 // notApprovedError fails the gate unless every row is Approved. A decider that returns any status other than Approved,
-// without an error still fails the job.
+// without an error still fails the job. The action, ref and Notes are quoted: an unpaired commit's name and an
+// error in the Notes can carry text read from the runner's logs.
 func notApprovedError(rows []githubactions.ActionReportRow) error {
 	var msg strings.Builder
 	for _, row := range githubactions.NotApproved(rows) {
 		if msg.Len() == 0 {
 			msg.WriteString("curation policy did not approve every GitHub Action this job resolved:")
 		}
-		fmt.Fprintf(&msg, "\n  %s@%s", row.Action, row.Ref)
+		fmt.Fprintf(&msg, "\n  %s", githubactions.QuoteForLog(row.Action+"@"+row.Ref))
 		fmt.Fprintf(&msg, ": status %q", row.Status)
 		if row.Notes != "" {
-			fmt.Fprintf(&msg, " - %s", row.Notes)
+			fmt.Fprintf(&msg, " - %s", githubactions.QuoteForLog(row.Notes))
 		}
 	}
 	if msg.Len() == 0 {
@@ -410,7 +529,8 @@ func (c *CurationActionsCommand) decideAll(ctx context.Context, decider githubac
 	for i, ref := range refs {
 		d := decisions[i]
 		if d.err != nil {
-			outcome.errs[i] = fmt.Errorf("deciding curation status for %s/%s@%s: %w", ref.Owner, ref.Repo, ref.Ref, d.err)
+			outcome.errs[i] = fmt.Errorf("deciding curation status for %s: %w",
+				githubactions.QuoteForLog(ref.Owner+"/"+ref.Repo+"@"+ref.Ref), d.err)
 			d.result = githubactions.ActionCurationResult{Status: githubactions.ActionUndetermined, Notes: d.err.Error()}
 		}
 		outcome.rows = append(outcome.rows, githubactions.NewActionReportRow(ref, d.result))
