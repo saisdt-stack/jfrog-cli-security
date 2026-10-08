@@ -32,6 +32,9 @@ type InstallOptions struct {
 	JfrogHomeDir string // the admin's JFROG_CLI_HOME_DIR, holding the server configuration
 	ServerID     string // "" to use that configuration's default server
 	Threads      int    // how many actions the hook decides at once; 0 leaves it to the command's default
+	// TrustActionCache passes --trust-action-cache to the hook: the admin vouches that no job can
+	// change the runner's action archive cache.
+	TrustActionCache bool
 }
 
 // Install writes the hook script and points the runner's .env at it. It returns warnings for
@@ -345,7 +348,7 @@ func bashHookScript(opts InstallOptions) string {
 	if opts.ServerID != "" {
 		sb.WriteString("export JFROG_CLI_SERVER_ID=" + shellQuote(opts.ServerID) + "\n")
 	}
-	sb.WriteString(shellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + shellQuote(opts.RunnerDir) + threadsArg(opts) + "\n")
+	sb.WriteString(shellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + shellQuote(opts.RunnerDir) + threadsArg(opts) + trustActionCacheArg(opts) + "\n")
 	return sb.String()
 }
 
@@ -363,7 +366,7 @@ func powerShellHookScript(opts InstallOptions) string {
 	if opts.ServerID != "" {
 		sb.WriteString("$env:JFROG_CLI_SERVER_ID = " + powerShellQuote(opts.ServerID) + "\n")
 	}
-	sb.WriteString("& " + powerShellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + powerShellQuote(opts.RunnerDir) + threadsArg(opts) + "\n")
+	sb.WriteString("& " + powerShellQuote(opts.JfPath) + " curate-gh-actions --runner-hook --runner-dir " + powerShellQuote(opts.RunnerDir) + threadsArg(opts) + trustActionCacheArg(opts) + "\n")
 	sb.WriteString("exit $LASTEXITCODE\n")
 	return sb.String()
 }
@@ -385,6 +388,14 @@ func threadsArg(opts InstallOptions) string {
 		return ""
 	}
 	return " --threads " + strconv.Itoa(opts.Threads)
+}
+
+// trustActionCacheArg is the --trust-action-cache the hook passes to jf, or "".
+func trustActionCacheArg(opts InstallOptions) string {
+	if !opts.TrustActionCache {
+		return ""
+	}
+	return " --trust-action-cache"
 }
 
 func shellQuote(s string) string {

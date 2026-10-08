@@ -41,6 +41,7 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	"github.com/urfave/cli"
 
+	"github.com/jfrog/jfrog-cli-security/commands/curation/githubactions"
 	"github.com/jfrog/jfrog-cli-security/commands/curation/runnerhook"
 	"github.com/jfrog/jfrog-cli-security/commands/enrich"
 	"github.com/jfrog/jfrog-cli-security/commands/sast_server"
@@ -670,7 +671,9 @@ const (
 )
 
 // curationActionsMode picks what one invocation of curate-gh-actions does from its flags.
-func curationActionsMode(runnerHook, install, uninstall bool, runnerDir string) (curationActionsRunMode, error) {
+// --trust-action-cache only means something to the hook, so it is accepted only when installing the
+// hook, which pins it into the hook script, and when running as the hook.
+func curationActionsMode(runnerHook, install, uninstall, trustActionCache bool, runnerDir string) (curationActionsRunMode, error) {
 	set := 0
 	for _, b := range []bool{runnerHook, install, uninstall} {
 		if b {
@@ -680,6 +683,9 @@ func curationActionsMode(runnerHook, install, uninstall bool, runnerDir string) 
 	if set > 1 {
 		return curateAsStep, errorutils.CheckErrorf("only one of --%s, --%s and --%s can be set",
 			flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook)
+	}
+	if trustActionCache && !runnerHook && !install {
+		return curateAsStep, errorutils.CheckErrorf("--%s can only be set with --%s", flags.TrustActionCache, flags.InstallRunnerHook)
 	}
 	if set == 1 && runnerDir == "" {
 		return curateAsStep, errorutils.CheckErrorf("--%s is required with --%s, --%s or --%s",
@@ -702,7 +708,7 @@ func curationActionsMode(runnerHook, install, uninstall bool, runnerDir string) 
 func CurationActionsCmd(c *components.Context) error {
 	runnerDir := c.GetStringFlagValue(flags.RunnerDir)
 	mode, err := curationActionsMode(c.GetBoolFlagValue(flags.RunnerHook), c.GetBoolFlagValue(flags.InstallRunnerHook),
-		c.GetBoolFlagValue(flags.UninstallRunnerHook), runnerDir)
+		c.GetBoolFlagValue(flags.UninstallRunnerHook), c.GetBoolFlagValue(flags.TrustActionCache), runnerDir)
 	if err != nil {
 		return err
 	}
@@ -729,7 +735,7 @@ func CurationActionsCmd(c *components.Context) error {
 		}
 		cmd := curation.NewCurationActionsCommand().SetServerDetails(serverDetails).SetParallelRequests(threads)
 		if mode == curateAsHook {
-			cmd.SetRunnerDir(runnerDir)
+			cmd.SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "").SetTrustActionCache(c.GetBoolFlagValue(flags.TrustActionCache))
 		}
 		return cmd.Run()
 	}
@@ -758,7 +764,8 @@ func installCurationActionsHook(c *components.Context, runnerDir string) error {
 	if err != nil {
 		return err
 	}
-	warnings, err := runnerhook.Install(runnerhook.InstallOptions{RunnerDir: runnerDir, JfPath: jfPath, JfrogHomeDir: homeDir, ServerID: serverID, Threads: threads})
+	warnings, err := runnerhook.Install(runnerhook.InstallOptions{RunnerDir: runnerDir, JfPath: jfPath, JfrogHomeDir: homeDir, ServerID: serverID, Threads: threads,
+		TrustActionCache: c.GetBoolFlagValue(flags.TrustActionCache)})
 	if err != nil {
 		return err
 	}

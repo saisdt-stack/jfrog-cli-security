@@ -1,6 +1,7 @@
 package githubactions
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,6 +26,11 @@ func TestParseSetupJobLines(t *testing.T) {
 	}, ParseSetupJobLines(text))
 }
 
+// workerLine returns message as the runner writes it into the Worker log.
+func workerLine(message string) string {
+	return "[2026-10-07 11:03:03Z INFO ActionManager] " + message + "\n"
+}
+
 func TestParseWorkerLog(t *testing.T) {
 	tests := []struct {
 		name string
@@ -32,66 +38,127 @@ func TestParseWorkerLog(t *testing.T) {
 		want []WorkerAction
 	}{
 		{
-			name: "verify when no cache is configured then the download line names the action",
-			log: "[2026-10-01 06:43:29Z INFO ActionManager] Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + "' into /r/_work/_actions/_temp_1/x.tar.gz.\n" +
-				"[2026-10-01 06:43:31Z INFO ActionManager] Request URL: https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + " X-GitHub-Request-Id: A Http Status: OK\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
+			name: "verify when only the download is logged then the action is a save",
+			log: workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+shaV4+"' into /r/_work/_actions/_temp_1/x.tar.gz.") +
+				workerLine("Request URL: https://codeload.github.com/actions/checkout/tar.gz/"+shaV4+" X-GitHub-Request-Id: A Http Status: OK"),
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceSave}},
 		},
 		{
-			name: "verify when only the download line is logged then it names the action",
-			log:  "Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + "' into /r/_work/_actions/_temp_1/x.tar.gz.\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
+			name: "verify when the symlink check finds the unpacked directory then it is a cache action in that cache",
+			log: workerLine("Checking if can symlink 'actions/checkout@"+shaV4+"'") +
+				workerLine("Found unpacked action directory '/c/Actions_Checkout/"+shaV4+"' in cache directory '/c'"),
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache, CacheDir: "/c"}},
 		},
 		{
-			name: "verify when the symlink check names an action then it is listed",
-			log: "[x INFO ActionManager] Checking if can symlink 'actions/checkout@" + shaV4 + "'\n" +
+			name: "verify when the unpacked directory found is another action's then it gives this one no cache",
+			log: workerLine("Checking if can symlink 'actions/checkout@"+shaV4+"'") +
+				workerLine("Found unpacked action directory '/c/actions_setup-node/"+shaV4+"' in cache directory '/c'") +
+				workerLine("Found unpacked action directory '/c/actions_checkout/"+shaV3+"' in cache directory '/c'"),
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache}},
+		},
+		{
+			name: "verify when the log names two cache directories then no action keeps one, since one must be forged",
+			log: workerLine("Check if action archive 'actions/checkout@"+shaV4+"' already exists in cache directory '/c'") +
+				workerLine("Check if action archive 'actions/setup-node@"+shaNode+"' already exists in cache directory '/locked'"),
+			want: []WorkerAction{
+				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache},
+				{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceCache},
+			},
+		},
+		{
+			name: "verify when a found-archive line names another cache directory then no action keeps one",
+			log: workerLine("Check if action archive 'actions/checkout@"+shaV4+"' already exists in cache directory '/c'") +
+				workerLine("Found action archive '/locked/actions_checkout/"+shaV4+".tar.gz' in cache directory '/locked'"),
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache}},
+		},
+		{
+			name: "verify when the lines name one cache directory spelled differently then each action keeps it",
+			log: workerLine("Check if action archive 'actions/checkout@"+shaV4+"' already exists in cache directory '/c/'") +
+				workerLine("Found action archive '/c/actions_checkout/"+shaV4+".tar.gz' in cache directory '/c'") +
+				workerLine("Checking if can symlink 'actions/setup-node@"+shaNode+"'") +
+				workerLine("Found unpacked action directory '/c/actions_setup-node/"+shaNode+"' in cache directory '/c/./'"),
+			want: []WorkerAction{
+				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache, CacheDir: "/c/"},
+				{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceCache, CacheDir: "/c/./"},
+			},
+		},
+		{
+			name: "verify when a found line lacks the runner prefix then it gives no cache",
+			log: workerLine("Checking if can symlink 'actions/checkout@"+shaV4+"'") +
 				"[x INFO ActionManager] Found unpacked action directory '/c/actions_checkout/" + shaV4 + "' in cache directory '/c'\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4}},
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache}},
 		},
 		{
-			name: "verify when the archive check names an action then it is listed",
-			log: "[x INFO ActionManager] Check if action archive 'actions/setup-node@" + shaNode + "' already exists in cache directory '/c'\n" +
-				"[x INFO ActionManager] Found action archive '/c/actions_setup-node/" + shaNode + ".tar.gz' in cache directory '/c'\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "setup-node", SHA: shaNode}},
+			name: "verify when the archive check names a cache directory then it is recorded",
+			log:  workerLine("Check if action archive 'actions/setup-node@" + shaNode + "' already exists in cache directory '/c'"),
+			want: []WorkerAction{{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceCache, CacheDir: "/c"}},
 		},
 		{
-			name: "verify when a symlink attempt falls through to a download then the action is listed once",
-			log: "Checking if can symlink 'actions/checkout@" + shaV3 + "'\n" +
-				"Check if action archive 'actions/checkout@" + shaV3 + "' already exists in cache directory '/c'\n" +
-				"Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + "' into /r/t.tar.gz.\n" +
-				"Request URL: https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + " X-GitHub-Request-Id: B Http Status: OK\n",
-			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV3}},
+			name: "verify when the save comes before its check then the action is still a save",
+			log: workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+shaV3+"' into /r/t.tar.gz.") +
+				workerLine("Check if action archive 'actions/checkout@"+shaV3+"' already exists in cache directory '/c'"),
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: shaV3, Source: SourceSave, CacheDir: "/c"}},
 		},
 		{
-			name: "verify when Windows paths and zipball URLs are logged then they are understood",
-			log: "Found unpacked action directory 'C:\\cache\\actions_checkout\\" + shaV4 + "' in cache directory 'C:\\cache'\n" +
-				"Checking if can symlink 'actions/checkout@" + shaV4 + "'\n" +
-				"Save archive 'https://api.github.com/repos/actions/setup-node/zipball/" + shaNode + "' into C:\\r\\t.zip.\n" +
-				"Request URL: https://api.github.com/repos/actions/setup-node/zipball/" + shaNode + " X-GitHub-Request-Id: C\n",
+			name: "verify when Windows paths, zipball URLs and CRLF line ends are logged then they are understood",
+			log: strings.ReplaceAll(workerLine("Check if action archive 'actions/checkout@"+shaV4+"' already exists in cache dir C:\\actionarchivecache\\")+
+				workerLine("Save archive 'https://api.github.com/repos/actions/setup-node/zipball/"+shaNode+"' into C:\\r\\t.zip."), "\n", "\r\n"),
 			want: []WorkerAction{
-				{Owner: "actions", Repo: "checkout", SHA: shaV4},
-				{Owner: "actions", Repo: "setup-node", SHA: shaNode},
+				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache, CacheDir: "C:\\actionarchivecache\\"},
+				{Owner: "actions", Repo: "setup-node", SHA: shaNode, Source: SourceSave},
 			},
 		},
 		{
-			name: "verify when one action is checked twice then it is listed once, in first-seen order",
-			log: "Checking if can symlink 'actions/checkout@" + shaV4 + "'\n" +
-				"Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV3 + "' into x\n" +
-				"Checking if can symlink 'Actions/Checkout@" + "11D5960A326750D5838078E36CF38B85AF677262" + "'\n",
+			name: "verify when one action is checked twice in different case then it is listed once, in first-seen order",
+			log: workerLine("Checking if can symlink 'actions/checkout@"+shaV4+"'") +
+				workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+shaV3+"' into x") +
+				workerLine("Checking if can symlink 'Actions/Checkout@11D5960A326750D5838078E36CF38B85AF677262'"),
 			want: []WorkerAction{
-				{Owner: "actions", Repo: "checkout", SHA: shaV4},
-				{Owner: "actions", Repo: "checkout", SHA: shaV3},
+				{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache},
+				{Owner: "actions", Repo: "checkout", SHA: shaV3, Source: SourceSave},
 			},
+		},
+		{
+			name: "verify when a line lacks the runner prefix then it is not read",
+			log:  "Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + shaV4 + "' into x\n[x INFO ActionManager] Checking if can symlink 'actions/checkout@" + shaV4 + "'\n",
+			want: nil,
 		},
 		{
 			name: "verify when the log names no action then nothing is returned",
-			log:  "[x INFO Worker] Version: 2.337.0\n",
+			log:  "[2026-10-01 06:43:29Z INFO Worker] Version: 2.337.0\n",
 			want: nil,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, ParseWorkerLog(tt.log))
+		})
+	}
+}
+
+func TestParseWorkerLogIgnoresTextInTheJobMessage(t *testing.T) {
+	real := "[2026-10-07 11:03:03Z INFO ActionManager] Check if action archive 'actions/checkout@" + sha40 + "' already exists, in cache dir /opt/actionarchivecache"
+	inJobMessage := "      \"script\": \"[2026-10-07 00:00:00Z INFO ActionManager] Check if action archive 'jobmsg/forged@" + sha40b + "' already exists\""
+	got := ParseWorkerLog(real + "\n" + inJobMessage)
+	assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: sha40, Source: SourceCache, CacheDir: "/opt/actionarchivecache"}}, got)
+}
+
+func TestWorkerLogBuildsImage(t *testing.T) {
+	tests := []struct {
+		name string
+		log  string
+		want bool
+	}{
+		{"verify when the runner counts steps that build an image then it builds", workerLine("2 steps need to build image from 'Dockerfile'"), true},
+		{"verify when the runner names the action it builds then it builds", workerLine("Action my-action (abc) from repository 'o/r' needs to build image 'Dockerfile'"), true},
+		{"verify when the runner only pulls an image then it does not build", workerLine("Action x (abc) from repository 'o/r' needs to pull image 'alpine:3'"), false},
+		{"verify when a build line is only quoted inside a job message then it does not build", "  \"run\": \"[2026-10-07 11:03:03Z INFO ActionManager] 1 steps need to build image from 'Dockerfile'\"\n", false},
+		{"verify when the log has no such line then it does not build", workerLine("Checking if can symlink 'actions/checkout@" + shaV4 + "'"), false},
+		{"verify when the build line ends in CRLF then it builds", strings.ReplaceAll(workerLine("1 steps need to build image from 'Dockerfile'"), "\n", "\r\n"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, WorkerLogBuildsImage(tt.log))
 		})
 	}
 }

@@ -124,6 +124,26 @@ func TestInstall(t *testing.T) {
 	})
 }
 
+func TestInstallRunnerHookTrustActionCache(t *testing.T) {
+	tests := []struct {
+		name  string
+		trust bool
+	}{
+		{name: "verify when installed with --trust-action-cache then the hook script passes it to jf", trust: true},
+		{name: "verify when installed without --trust-action-cache then the hook script does not pass it", trust: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := fakeRunner(t, "")
+			_, err := Install(InstallOptions{RunnerDir: dir, JfPath: "/usr/local/bin/jf", JfrogHomeDir: "/etc/jfrog", TrustActionCache: tt.trust})
+			require.NoError(t, err)
+			script := readFile(t, filepath.Join(dir, ".jfrog", flavorFor(runtime.GOOS).scriptName))
+			assert.Equal(t, tt.trust, strings.Contains(script, "--trust-action-cache"),
+				"Install(TrustActionCache: %v) wrote:\n%s", tt.trust, script)
+		})
+	}
+}
+
 func TestUninstall(t *testing.T) {
 	install := func(t *testing.T, dir string) {
 		t.Helper()
@@ -244,6 +264,22 @@ func TestHookScripts(t *testing.T) {
 			want: "#!/bin/bash\n" + header +
 				"export JFROG_CLI_HOME_DIR='/h'\n" +
 				"'/jf' curate-gh-actions --runner-hook --runner-dir '/r' --threads 8\n",
+		},
+		{
+			name: "verify when bash pins --trust-action-cache then the hook passes it to jf", render: bashHookScript,
+			opts: InstallOptions{RunnerDir: "/r", JfPath: "/jf", JfrogHomeDir: "/h", Threads: 8, TrustActionCache: true},
+			want: "#!/bin/bash\n" + header +
+				"export JFROG_CLI_HOME_DIR='/h'\n" +
+				"'/jf' curate-gh-actions --runner-hook --runner-dir '/r' --threads 8 --trust-action-cache\n",
+		},
+		{
+			name: "verify when powershell pins --trust-action-cache then the hook passes it to jf", render: powerShellHookScript,
+			opts: InstallOptions{RunnerDir: `C:\r`, JfPath: `C:\jf.exe`, JfrogHomeDir: `C:\h`, TrustActionCache: true},
+			want: "\ufeff" + header +
+				"$ErrorActionPreference = 'Stop'\n" +
+				`$env:JFROG_CLI_HOME_DIR = 'C:\h'` + "\n" +
+				`& 'C:\jf.exe' curate-gh-actions --runner-hook --runner-dir 'C:\r' --trust-action-cache` + "\n" +
+				"exit $LASTEXITCODE\n",
 		},
 		{
 			name: "verify when powershell pins --threads then the hook passes it to jf", render: powerShellHookScript,

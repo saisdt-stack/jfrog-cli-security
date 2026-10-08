@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +19,10 @@ const resolvedSHANotePrefix = "resolved SHA: "
 // contentMismatchNote opens the Notes of an action whose runner copy is not the content Artifactory
 // approved. Kept verbatim so it can be searched for.
 const contentMismatchNote = "not able to decide since content is mismatched"
+
+// unpairedLoggedCommitNote ends the Notes of a logged commit no _actions folder was paired with, so the
+// reader knows the row is a commit, not a folder of the runner.
+const unpairedLoggedCommitNote = "unpaired logged commit"
 
 // spoolPattern names the temp file a downloaded archive is saved to while it is compared.
 const spoolPattern = "jfrog-curation-action-*.tar.gz"
@@ -44,8 +49,16 @@ func NewArtifactoryActionCurationDecider(serverDetails *config.ServerDetails) (A
 // runner holds the approved version: Approved when they are identical, Rejected with
 // contentMismatchNote when they are not - the runner and Artifactory resolved a moving tag or branch
 // to different commits. A curation block is Rejected with Artifactory's reason. A mismatch is a
-// verdict, not an error, so the other actions are still decided. When the runner's own logs name the
-// commit (hook mode), decideRunnerCommit decides that commit instead and nothing is compared.
+// verdict, not an error, so the other actions are still decided.
+//
+// Three paths. When the runner's own logs name the commit and ref.Verification is VerifyLoggedSHA,
+// decideRunnerCommit decides that commit and nothing is compared; an unpaired logged commit (see
+// ActionRef.Unpaired) always takes this path and says so in its Notes. When the logs name a commit but
+// the log is not trusted (the zero Verification), the runner's copy is compared with that commit's
+// archive and the ref is not resolved again. With no logged commit the ref is resolved and compared.
+//
+// A ref with ref.LoggedSHAs whose tag or branch resolves, through the refs list, to one of those
+// commits is decided like the first path: the commit is the runner's, so nothing is compared.
 //
 // Owner and Repo are matched case-insensitively. The ref is case-sensitive; only a full object ID
 // is lower-cased.
@@ -54,8 +67,16 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 		return ActionCurationResult{}, err
 	}
 	owner, repo := strings.ToLower(ref.Owner), strings.ToLower(ref.Repo)
-	if ref.RunnerSHA != "" {
-		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.RunnerSHA)
+	switch {
+	case ref.RunnerSHA != "" && ref.Verification == VerifyLoggedSHA:
+		result, err := d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.RunnerSHA)
+		if err == nil && ref.Unpaired() {
+			result.Notes += "; " + unpairedLoggedCommitNote
+		}
+		return result, err
+	case ref.RunnerSHA != "":
+		return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref,
+			ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref.RunnerSHA)})
 	}
 
 	var adv *RefAdvertisement
@@ -70,6 +91,35 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 		return ActionCurationResult{}, err
 	}
 
+	if commit, ok := loggedCommitOf(ref, adv, resolved); ok {
+		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, commit)
+	}
+	return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref, resolved)
+}
+
+// loggedCommitOf returns the commit resolved names when it is one of ref.LoggedSHAs: that commit is
+// then the one the runner fetched, whatever the folder holds. A tag that has moved, or a ref the
+// advertisement cannot resolve to a commit, pairs with nothing and is not a mismatch.
+func loggedCommitOf(ref ActionRef, adv *RefAdvertisement, resolved ResolvedRef) (string, bool) {
+	if len(ref.LoggedSHAs) == 0 || adv == nil {
+		return "", false
+	}
+	commit := strings.ToLower(resolved.APIRef)
+	switch resolved.Kind {
+	case RefKindTag:
+		commit, _ = adv.Commit(tagsPrefix + resolved.APIRef)
+	case RefKindBranch:
+		commit, _ = adv.Commit(headsPrefix + resolved.APIRef)
+	}
+	if commit == "" {
+		return "", false
+	}
+	return commit, slices.ContainsFunc(ref.LoggedSHAs, func(sha string) bool { return strings.EqualFold(sha, commit) })
+}
+
+// compareAtCommit downloads resolved and compares the archive with the runner's copy at ref.Path,
+// which is only ever read.
+func (d *artifactoryActionCurationDecider) compareAtCommit(artifactoryVcsRepo, owner, repo string, ref ActionRef, resolved ResolvedRef) (ActionCurationResult, error) {
 	body, filename, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
 	var blocked *BlockedError
 	if errors.As(err, &blocked) {
@@ -105,18 +155,30 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 		comparison.Identical, comparison.FirstDifference, time.Since(started)))
 
 	if !comparison.Identical {
-		return ActionCurationResult{Status: ActionRejected, Notes: mismatchNotes(comparison, sha)}, nil
+		return ActionCurationResult{Status: ActionRejected, Notes: mismatchNotes(comparison, sha) + verifiedByContentNote(ref)}, nil
 	}
 	result := ActionCurationResult{Status: ActionApproved}
 	if sha != "" {
 		result.Notes = resolvedSHANotePrefix + sha
 	}
+	result.Notes += verifiedByContentNote(ref)
 	return result, nil
 }
 
-// decideRunnerCommit decides the exact commit the runner's logs say it fetched, so no ref is looked
-// up and the runner's copy is not compared: the commit identifies the content, and the runner's
-// action cache is the admin's, trusted to hold what its SHA names.
+// verifiedByContentNote is the Notes suffix that tells the reader the runner's copy was compared
+// although its log named a commit, with the short code saying why. The full reasons are in the job's
+// one warning, so a long string never lands in every row.
+func verifiedByContentNote(ref ActionRef) string {
+	if ref.ContentReason == "" {
+		return ""
+	}
+	return "; verified by content: " + ref.ContentReason
+}
+
+// decideRunnerCommit is the fast path, valid only for a log whose trust has been assessed. It decides
+// the exact commit the runner's logs say it fetched, so no ref is looked up and the runner's copy is
+// not compared: the commit identifies the content, and the runner's action cache is the admin's,
+// trusted to hold what its SHA names.
 //
 // Because the request names the commit, curation audit records this action by its SHA,
 // not by the tag or branch the workflow wrote.

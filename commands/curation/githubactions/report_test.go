@@ -40,6 +40,12 @@ func TestNewActionReportRow(t *testing.T) {
 			want: ActionReportRow{Action: "some-org/transitive-action", Ref: "v1", Parent: "github/codeql-action@v3",
 				Status: "Rejected", Notes: "policy failure"},
 		},
+		{
+			name:   "verify when the ref is an unpaired logged commit then the ref cell names its SHA",
+			ref:    ActionRef{Owner: "actions", Repo: "checkout", RunnerSHA: "11d5960a326750d5838078e36cf38b85af677262", Verification: VerifyLoggedSHA},
+			result: ActionCurationResult{Status: ActionApproved},
+			want:   ActionReportRow{Action: "actions/checkout", Ref: "11d5960a326750d5838078e36cf38b85af677262", Status: "Approved"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

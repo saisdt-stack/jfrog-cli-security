@@ -28,6 +28,7 @@ Common patterns:
 Gotchas:
 - As a workflow step, put it first in the job. Even then, the pre scripts of the job's actions ('pre:' in their action.yml) run before it; only the hook runs before them.
 - --threads sets how many actions are decided at once (default 3). Given with --install-runner-hook, the hook uses that value.
+- On a self-hosted runner with an action archive cache (ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE), the hook compares an action loaded from that cache by content unless the cache is owned by another user and read-only to the runner's user, since an earlier job could have changed it. --trust-action-cache, given with --install-runner-hook, decides such actions by their logged commit instead; it is for an administrator who keeps the cache read-only, or accepts that a job on the same user could also edit the hook.
 - An action that cannot be decided (Artifactory unreachable, ref not found) is reported Undetermined and fails the job; the other actions are still decided. An authentication failure stops the run.
 - A tag or branch that moved after the runner downloaded it can be Rejected as a content mismatch; re-running the job resolves it. Pinning actions to a full commit SHA avoids this.
 - After installing the hook, start the runner, or restart it if it is already running. The hook runs before any step or pre script, decides each action by the exact commit the runner fetched, so the report and the curation audit show that SHA, and its report appears in the job's "Set up runner" step and on the run's summary page.

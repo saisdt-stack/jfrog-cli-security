@@ -35,6 +35,9 @@ type CurationActionsCommand struct {
 	vcsRepoResolver  githubactions.ArtifactoryVcsRepoResolver
 	discoverer       actionDiscoverer
 	runnerDir        string
+	callerMode       githubactions.CallerMode
+	self             string
+	trustActionCache bool
 }
 
 func NewCurationActionsCommand() *CurationActionsCommand {
@@ -111,10 +114,27 @@ func (c *CurationActionsCommand) SetActionDiscoverer(d actionDiscoverer) *Curati
 	return c
 }
 
-// SetRunnerDir selects hook mode: the command runs as the self-hosted runner's job-started hook and
-// reads the runner's logs under dir/_diag, in addition to its action cache.
+// SetRunnerDir names the runner's directory, whose _diag logs the command reads in the mode
+// SetCallerMode sets, in addition to its action cache.
 func (c *CurationActionsCommand) SetRunnerDir(dir string) *CurationActionsCommand {
 	c.runnerDir = dir
+	return c
+}
+
+// SetCallerMode says where in the job the command runs: githubactions.ModeHook for the self-hosted
+// runner's job-started hook, githubactions.ModePre for an action's pre script, where self is that
+// action's "owner/repo". Either reads the runner's logs under the directory SetRunnerDir names.
+func (c *CurationActionsCommand) SetCallerMode(mode githubactions.CallerMode, self string) *CurationActionsCommand {
+	c.callerMode = mode
+	c.self = self
+	return c
+}
+
+// SetTrustActionCache is the admin's --trust-action-cache: actions the runner loaded from its archive
+// or symlink cache are decided by their logged SHA even when this job's user could write that cache.
+// It only matters when the command reads the runner's logs on a self-hosted runner.
+func (c *CurationActionsCommand) SetTrustActionCache(trust bool) *CurationActionsCommand {
+	c.trustActionCache = trust
 	return c
 }
 
@@ -123,11 +143,18 @@ func (c *CurationActionsCommand) discovererFor(actionsCacheDir string) actionDis
 	switch {
 	case c.discoverer != nil:
 		return c.discoverer
-	case c.runnerDir != "":
-		return runnerLogDiscoverer{runnerDir: c.runnerDir, actionsCacheDir: actionsCacheDir}
+	case c.readsRunnerLogs():
+		return runnerLogDiscoverer{runnerDir: c.runnerDir, actionsCacheDir: actionsCacheDir, mode: c.callerMode, self: c.self,
+			trustActionCache: c.trustActionCache}
 	default:
 		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir}
 	}
+}
+
+// readsRunnerLogs reports whether the command runs inside the job before its steps - as the hook or
+// in a pre script - rather than as a step, so it reads the runner's logs and has no workflow file.
+func (c *CurationActionsCommand) readsRunnerLogs() bool {
+	return c.callerMode == githubactions.ModeHook || c.callerMode == githubactions.ModePre
 }
 
 func (c *CurationActionsCommand) CommandName() string {
@@ -165,9 +192,10 @@ func (c *CurationActionsCommand) Run() (err error) {
 
 	var used githubactions.JobUses
 	attributed := false
-	// In hook mode the job has not checked anything out yet, so a workflow file in the workspace is
-	// a previous run's: attributing from it could name the wrong parents and hide local actions.
-	if c.runnerDir == "" {
+	// As the hook or in a pre script the job has not checked anything out yet, so a workflow file in
+	// the workspace is a previous run's: attributing from it could name the wrong parents and hide
+	// local actions.
+	if !c.readsRunnerLogs() {
 		if used, attributed, err = c.parseWorkflowUses(workingDir); err != nil {
 			return err
 		}
@@ -470,7 +498,7 @@ func curatedActions(rows []githubactions.ActionReportRow, attributed bool, local
 
 // recordSummary records the report through the "security" job-summary manager
 func (c *CurationActionsCommand) recordSummary(curated formats.CuratedActions) error {
-	if c.runnerDir == "" {
+	if !c.readsRunnerLogs() {
 		return output.RecordSecurityCommandSummary(output.NewCurationActionsSummary(curated))
 	}
 	return appendStepSummary(curated)
@@ -479,11 +507,11 @@ func (c *CurationActionsCommand) recordSummary(curated formats.CuratedActions) e
 // stepSummaryEnvVar names the file whose markdown the runner shows on the run's summary page.
 const stepSummaryEnvVar = "GITHUB_STEP_SUMMARY"
 
-// appendStepSummary writes the report to the job's summary page in hook mode. A step's recorded
-// summary is rendered by setup-jfrog-cli's post-job step, which a hook runs before; but the runner
-// gives the hook a step summary file of its own and attaches it to the job as it does a step's
-// (JobHookProvider.RunHook, CreateStepSummaryCommand). Outside a runner the variable is unset and
-// nothing is written.
+// appendStepSummary writes the report to the job's summary page as the hook or in a pre script. A
+// step's recorded summary is rendered by setup-jfrog-cli's post-job step, which both run before; but
+// the runner gives the hook, and a pre script, a step summary file of its own and attaches it to the
+// job as it does a step's (JobHookProvider.RunHook, CreateStepSummaryCommand). Outside a runner the
+// variable is unset and nothing is written.
 func appendStepSummary(curated formats.CuratedActions) (err error) {
 	path := os.Getenv(stepSummaryEnvVar)
 	if path == "" {

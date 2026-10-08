@@ -55,6 +55,7 @@ func TestParseGitRefsContractFixture(t *testing.T) {
 			"refs/heads/main":     branchTip,
 			"refs/tags/collision": tagObject,
 		},
+		Peeled: map[string]string{"refs/tags/collision": tagCommit},
 	}, got)
 }
 
@@ -112,6 +113,7 @@ func TestParseGitRefsValid(t *testing.T) {
 			want: &RefAdvertisement{
 				ObjectFormat: "sha256",
 				Refs:         map[string]string{"refs/heads/main": sha256Object, "refs/tags/v1": sha256Object2},
+				Peeled:       map[string]string{"refs/tags/v1": sha256Object},
 			},
 		},
 		{
@@ -300,4 +302,19 @@ func TestParseGitRefsCapturedAdvertisements(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRefAdvertisementCommit(t *testing.T) {
+	adv := &RefAdvertisement{
+		Refs:   map[string]string{"refs/heads/main": branchTip, "refs/tags/collision": tagObject},
+		Peeled: map[string]string{"refs/tags/collision": tagCommit},
+	}
+	got, ok := adv.Commit("refs/tags/collision")
+	assert.True(t, ok)
+	assert.Equal(t, tagCommit, got, "an annotated tag is answered by its peeled commit, not the tag object")
+	got, ok = adv.Commit("refs/heads/main")
+	assert.True(t, ok)
+	assert.Equal(t, branchTip, got)
+	_, ok = adv.Commit("refs/heads/gone")
+	assert.False(t, ok)
 }

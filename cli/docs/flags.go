@@ -174,6 +174,7 @@ const (
 	RunnerDir             = "runner-dir"
 	InstallRunnerHook     = "install-runner-hook"
 	UninstallRunnerHook   = "uninstall-runner-hook"
+	TrustActionCache      = "trust-action-cache"
 
 	// Unique git flags
 	gitPrefix       = "git-"
@@ -240,7 +241,7 @@ var commandFlags = map[string][]string{
 	CurationAudit: {
 		CurationOutput, WorkingDirs, Threads, RequirementsFile, InsecureTls, useWrapperAudit, UseIncludedBuilds, SolutionPath, DockerImageName, HuggingFaceModel, IncludeCachedPackages, MvnIncludePluginDeps, LegacyPeerDeps, RunNative, Script,
 	},
-	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook},
+	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook, TrustActionCache},
 	GitCountContributors: {
 		InputFile, ScmType, ScmApiUrl, Token, Owner, RepoName, Months, DetailedSummary, InsecureTls, GitThreads, CacheValidity,
 	},
@@ -370,6 +371,7 @@ var flagsMap = map[string]components.Flag{
 	RunnerDir:                     components.NewStringFlag(RunnerDir, "The self-hosted runner's installation directory (the one holding config.sh, or config.cmd on Windows)."),
 	InstallRunnerHook:             components.NewBoolFlag(InstallRunnerHook, "Install this command as the job-started hook of the self-hosted runner in --runner-dir. A runner-admin operation, refused inside a job. If the runner already has a job-started hook, its .env is left as is and you are told the line to add to that hook. If the runner is already running, restart it afterwards."),
 	UninstallRunnerHook:           components.NewBoolFlag(UninstallRunnerHook, "Remove the job-started hook installed by --install-runner-hook from the runner in --runner-dir. Refused while another job-started hook still calls it. If the runner is already running, restart it afterwards."),
+	TrustActionCache:              components.NewBoolFlag(TrustActionCache, "With --install-runner-hook: let the hook decide an action the runner loaded from its action archive cache (ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE) by the commit it logged, even when the runner's user owns or can write that cache. Without it, such an action is compared by content unless the cache is owned by another user and read-only to that user. For an administrator who keeps the cache read-only, or accepts that a job on the same user could also edit the hook."),
 	binarySca:                     components.NewBoolFlag(Sca, fmt.Sprintf("Selective scanners mode: Execute SCA (Software Composition Analysis) sub-scan. Use --%s to run both SCA and Contextual Analysis. Use --%s --%s to to run SCA. Can be combined with --%s.", Sca, Sca, WithoutCA, Secrets)),
 	binarySecrets:                 components.NewBoolFlag(Secrets, fmt.Sprintf("Selective scanners mode: Execute Secrets sub-scan. Can be combined with --%s.", Sca)),
 	binaryWithoutCA:               components.NewBoolFlag(WithoutCA, fmt.Sprintf("Selective scanners mode: Disable Contextual Analysis scanner after SCA. Relevant only with --%s flag.", Sca)),

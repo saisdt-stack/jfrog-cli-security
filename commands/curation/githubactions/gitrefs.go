@@ -11,15 +11,29 @@ import (
 
 // RefAdvertisement is the part of a git smart-HTTP upload-pack reference advertisement that ref
 // classification reads. Every record is parsed, but only refs/... records are kept and validated:
-// HEAD, peeled "<tag>^{}" records and the capabilities other than object-format are skipped, since
-// no ref an action can be pinned to resolves through them - uses: always names a ref, and the
-// download APIs peel annotated tags themselves.
+// HEAD and the capabilities other than object-format are skipped, since no ref an action can be
+// pinned to resolves through them - uses: always names a ref, and the download APIs peel annotated
+// tags themselves. Peeled "<tag>^{}" records are kept apart, so the commit of an annotated tag
+// can be told.
 type RefAdvertisement struct {
 	// ObjectFormat is "sha1" or "sha256".
 	ObjectFormat string
 	// Refs maps each full ref name ("refs/heads/main", "refs/tags/v1", "refs/pull/1/head") to its
 	// advertised object ID. For an annotated tag this is the tag object, not the commit.
 	Refs map[string]string
+	// Peeled maps the full name of an annotated tag to the commit it points at; nil when the
+	// advertisement has no annotated tag.
+	Peeled map[string]string
+}
+
+// Commit returns the commit the full ref name points at: the peeled commit of an annotated tag,
+// the advertised ID of any other ref. It reports false when the ref is not advertised.
+func (a *RefAdvertisement) Commit(name string) (string, bool) {
+	if peeled, ok := a.Peeled[name]; ok {
+		return peeled, true
+	}
+	oid, ok := a.Refs[name]
+	return oid, ok
 }
 
 const (
@@ -139,18 +153,25 @@ func applyObjectFormat(capList string, adv *RefAdvertisement) error {
 	return nil
 }
 
-// addRefRecord stores one "<object-id> SP <ref-name>" record when it is a refs/... ref; any other
-// record - HEAD, a peeled "^{}" record, an empty repository's "capabilities^{}" - is skipped.
+// addRefRecord stores one "<object-id> SP <ref-name>" record when it is a refs/... ref, a peeled "^{}"
+// record under Peeled; any other record - HEAD, an empty repository's "capabilities^{}" - is skipped.
 func addRefRecord(record string, adv *RefAdvertisement) error {
 	oid, name, err := splitRecord(record)
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(name, refsPrefix) || strings.HasSuffix(name, peeledSuffix) {
+	if !strings.HasPrefix(name, refsPrefix) {
 		return nil
 	}
 	if err = validateObjectID(oid, adv.ObjectFormat); err != nil {
 		return fmt.Errorf("git ref %q: %w", name, err)
+	}
+	if base, peeled := strings.CutSuffix(name, peeledSuffix); peeled {
+		if adv.Peeled == nil {
+			adv.Peeled = map[string]string{}
+		}
+		adv.Peeled[base] = oid
+		return nil
 	}
 	if !validRefName(name) {
 		return fmt.Errorf("invalid git ref name %q", name)

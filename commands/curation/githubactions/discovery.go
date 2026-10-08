@@ -34,13 +34,27 @@ func ErrCacheNotReadable() error {
 	return errorutils.CheckError(errors.New(errCacheNotReadable))
 }
 
+// Verification is how much of the runner's copy a decider must read before approving an action.
+type Verification int
+
+const (
+	// VerifyContent, the zero value, compares the runner's copy with the approved archive. A caller
+	// that does not decide otherwise gets this.
+	VerifyContent Verification = iota
+	// VerifyLoggedSHA approves the commit the runner's own log names, without reading the copy. Only
+	// for a log whose trust has been assessed.
+	VerifyLoggedSHA
+)
+
 // ActionRef is one resolved action instance found in the runner's action cache.
 type ActionRef struct {
 	Owner string
 	Repo  string
-	// Ref is taken verbatim from the cache directory name; it may be a SHA, tag or branch.
+	// Ref is taken verbatim from the cache directory name; it may be a SHA, tag or branch. It is ""
+	// only for an unpaired logged commit (see Unpaired).
 	Ref string
-	// Path is the absolute path to _work/_actions/<Owner>/<Repo>/<Ref>.
+	// Path is the absolute path to _work/_actions/<Owner>/<Repo>/<Ref>; "" only for an unpaired
+	// logged commit.
 	Path string
 	// Subpaths holds every distinct subpath the job invoked this action through - a monorepo
 	// action such as github/codeql-action can be used via several from one owner/repo/ref.
@@ -50,6 +64,23 @@ type ActionRef struct {
 	// RunnerSHA is the commit the runner fetched for this action, when the runner's logs name it;
 	// "" when they do not, which is always the case for a step on a GitHub-hosted runner.
 	RunnerSHA string
+	// Verification is how the decider checks this action; the zero value compares content.
+	Verification Verification
+	// ContentReason is why Verification is VerifyContent although the runner's log named a commit:
+	// a short fixed code (log-untrusted, first-step, no-sha, cache-source, renamed, stale-line),
+	// never log text. "" when there is nothing to explain.
+	ContentReason string
+	// LoggedSHAs is, for a ref the runner's logs gave no SHA in a job whose logs are trusted, every
+	// commit the Worker log names for this repository (lower case): the decider pairs the ref with
+	// one of them through the repository's refs list, without reading the folder. nil otherwise.
+	LoggedSHAs []string
+}
+
+// Unpaired reports whether r is a commit the runner's Worker log names that no _actions folder was
+// paired with. It has no ref and no path, so it can be decided only by its SHA; the folders of its
+// repository are decided on their own.
+func (r ActionRef) Unpaired() bool {
+	return r.Ref == "" && r.Path == "" && r.RunnerSHA != ""
 }
 
 // UnaccountedEntry is a cache entry that exists but could not be resolved to an action.

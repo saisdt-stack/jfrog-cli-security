@@ -24,9 +24,14 @@ func NewActionReportRow(ref ActionRef, result ActionCurationResult) ActionReport
 	if len(ref.Subpaths) > 0 {
 		action += " (" + strings.Join(ref.Subpaths, ", ") + ")"
 	}
+	// An unpaired logged commit has no ref; its SHA is what the reader and the gate's message need.
+	shown := ref.Ref
+	if ref.Unpaired() {
+		shown = ref.RunnerSHA
+	}
 	return ActionReportRow{
 		Action: action,
-		Ref:    ref.Ref,
+		Ref:    shown,
 		Parent: ref.Parent,
 		Status: string(result.Status),
 		Notes:  result.Notes,
