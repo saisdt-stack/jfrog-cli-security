@@ -24,9 +24,14 @@ func NewActionReportRow(ref ActionRef, result ActionCurationResult) ActionReport
 	if len(ref.Subpaths) > 0 {
 		action += " (" + strings.Join(ref.Subpaths, ", ") + ")"
 	}
+	// An unpaired logged commit has no ref; its SHA is what the reader and the gate's message need.
+	shown := ref.Ref
+	if ref.Unpaired() {
+		shown = ref.RunnerSHA
+	}
 	return ActionReportRow{
 		Action: action,
-		Ref:    ref.Ref,
+		Ref:    shown,
 		Parent: ref.Parent,
 		Status: string(result.Status),
 		Notes:  result.Notes,
@@ -41,45 +46,45 @@ func NewActionReportRow(ref ActionRef, result ActionCurationResult) ActionReport
 // printed to the job log and read there. The job summary renders its own table from the recorded
 // summary files; the shared piece is the cell escaping, not the table.
 func RenderReportTable(rows []ActionReportRow, withParent bool) string {
-	var sb strings.Builder
+	headers := []string{"Action", "Ref"}
 	if withParent {
-		sb.WriteString("| Action | Ref | Parent | Status | Notes |\n")
-		sb.WriteString("|--------|-----|--------|--------|-------|\n")
-	} else {
-		sb.WriteString("| Action | Ref | Status | Notes |\n")
-		sb.WriteString("|--------|-----|--------|-------|\n")
+		headers = append(headers, "Parent")
 	}
+	headers = append(headers, "Status", "Notes")
+
+	var sb strings.Builder
+	sb.WriteString("| " + strings.Join(headers, " | ") + " |\n|")
+	for _, header := range headers {
+		sb.WriteString(strings.Repeat("-", len(header)+2) + "|")
+	}
+	sb.WriteString("\n")
 	for _, row := range rows {
-		sb.WriteString("| ")
-		sb.WriteString(formats.EscapeTerminalTableCell(row.Action))
-		sb.WriteString(" | ")
-		sb.WriteString(formats.EscapeTerminalTableCell(row.Ref))
+		cells := []string{row.Action, row.Ref}
 		if withParent {
-			sb.WriteString(" | ")
-			sb.WriteString(formats.EscapeTerminalTableCell(row.Parent))
+			cells = append(cells, row.Parent)
 		}
-		sb.WriteString(" | ")
-		sb.WriteString(formats.EscapeTerminalTableCell(row.Status))
-		sb.WriteString(" | ")
-		sb.WriteString(formats.EscapeTerminalTableCell(row.Notes))
-		sb.WriteString(" |\n")
+		cells = append(cells, row.Status, row.Notes)
+		for i := range cells {
+			cells[i] = formats.EscapeTerminalTableCell(cells[i])
+		}
+		sb.WriteString("| " + strings.Join(cells, " | ") + " |\n")
 	}
 	return sb.String()
+}
+
+// Approved reports whether the row's Status is exactly ActionApproved.
+func (r ActionReportRow) Approved() bool {
+	return r.Status == string(ActionApproved)
 }
 
 // NotApproved returns every row whose Status is not exactly ActionApproved, for the command's
 // exit-code decision.
 //
-// An allow-list, deliberately, rather than a test for ActionRejected: ActionCurationStatus is an
-// open string type, so a status this code does not recognize - one a later decider introduces, or
-// the zero value of a result returned without one - would pass a deny-list while rendering as an
-// empty cell. Only an explicit approval may clear a gate whose purpose is to stop whatever it has
-// not cleared. This is not part of the mocked seam; the real decider replaces the verdict, not
-// the enforcement.
+// An allow-list, not a check for Rejected: an unknown or zero-value status must fail the gate too.
 func NotApproved(rows []ActionReportRow) []ActionReportRow {
 	var notApproved []ActionReportRow
 	for _, row := range rows {
-		if row.Status != string(ActionApproved) {
+		if !row.Approved() {
 			notApproved = append(notApproved, row)
 		}
 	}

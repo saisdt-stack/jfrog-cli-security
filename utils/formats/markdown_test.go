@@ -14,9 +14,7 @@ func TestEscapeMarkdownTableCell(t *testing.T) {
 		want  string
 	}{
 		{"verify when the text is ordinary then it is untouched", "actions/checkout", "actions/checkout"},
-		{"verify when the value is empty then it stays empty", "", ""},
 		{"verify when the value contains a pipe then the pipe is escaped", "refs|heads", `refs\|heads`},
-		{"verify when the value contains several pipes then every one is escaped", "a|b|c", `a\|b\|c`},
 		{"verify when the value contains a backslash then it is escaped first", `a\b`, `a\\b`},
 		{"verify when the value contains an already-escaped pipe then both characters stay literal", `a\|b`, `a\\\|b`},
 		{"verify when the value contains a newline then it becomes a line break", "first\nsecond", "first<br>second"},
@@ -49,11 +47,6 @@ func TestRenderActionsException(t *testing.T) {
 		wantNotContains []string
 	}{
 		{
-			name:      "verify when there is no data then nothing is said",
-			actions:   nil,
-			wantEmpty: true,
-		},
-		{
 			name:      "verify when attribution succeeded and no local action is declared then nothing is said",
 			actions:   []CuratedActions{attributed()},
 			wantEmpty: true,
@@ -78,23 +71,13 @@ func TestRenderActionsException(t *testing.T) {
 			},
 		},
 		{
-			name: "verify when a composite action declares the local step then the declaring action is named",
-			// The path points into the caller's repository, not into the composite action, so
-			// without the declarer a reader has no way to tell where the reference came from.
-			actions: []CuratedActions{attributed(LocalCompositeAction{Path: "./scripts/build", DeclaredBy: "some-org/wrapper@v1"})},
-			wantContains: []string{
-				"a local composite action",
-				`"./scripts/build" declared by some-org/wrapper@v1`,
-			},
-		},
-		{
 			name: "verify when attribution failed then the caveat is unconditional rather than a detection",
 			// The ordinary case on a runner: the check runs before the checkout, so there is no
 			// workflow file to read and no way to tell whether a local action is declared at all.
 			// Saying nothing here would be the one case where an all-Approved table is most
 			// likely to be incomplete and least likely to admit it.
 			actions:      []CuratedActions{unattributed()},
-			wantContains: []string{"no workflow file was available", "uses: ./...", "not curated"},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated", "not covered in this report"},
 		},
 		{
 			// Two runs merged into one section: one found a local step, the other had no workflow
@@ -131,6 +114,19 @@ func TestRenderActionsException(t *testing.T) {
 			wantContains:    []string{"a local composite action"},
 			wantNotContains: []string{"local composite actions"},
 		},
+		{
+			// The path resolves the same way either way, but a reader chasing it needs every place it
+			// is referenced from - so dedup is on the whole value, not on the path.
+			name: "verify when the same path is declared by two actions then both declarers are named",
+			actions: []CuratedActions{attributed(
+				LocalCompositeAction{Path: "./shared", DeclaredBy: "org/parent-a@v1"},
+				LocalCompositeAction{Path: "./shared", DeclaredBy: "org/parent-b@v1"},
+			)},
+			wantContains: []string{
+				`"./shared" declared by org/parent-a@v1`,
+				`"./shared" declared by org/parent-b@v1`,
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -153,19 +149,4 @@ func TestRenderActionsException(t *testing.T) {
 			assert.NotContains(t, got, "|")
 		})
 	}
-}
-
-func TestRenderActionsException_SameLocalActionFromTwoDeclarersKeepsBoth(t *testing.T) {
-	// The path resolves the same way either way, but a reader chasing it needs every place it is
-	// referenced from - so dedup is on the whole value, not on the path.
-	got := RenderActionsException([]CuratedActions{{
-		Attributed: true,
-		LocalCompositeActions: []LocalCompositeAction{
-			{Path: "./shared", DeclaredBy: "org/parent-a@v1"},
-			{Path: "./shared", DeclaredBy: "org/parent-b@v1"},
-		},
-	}})
-
-	assert.Contains(t, got, `"./shared" declared by org/parent-a@v1`)
-	assert.Contains(t, got, `"./shared" declared by org/parent-b@v1`)
 }

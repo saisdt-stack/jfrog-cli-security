@@ -461,22 +461,30 @@ func GenerateActionsCurationSectionMarkdown(actionsData []formats.ResultsSummary
 			break
 		}
 	}
+	headers := []string{"Action", "Ref"}
 	if withParent {
-		markdown += "\n\n| Action | Ref | Parent | Status | Notes |\n|--------|-----|--------|--------|-------|"
-	} else {
-		markdown += "\n\n| Action | Ref | Status | Notes |\n|--------|-----|--------|-------|"
+		headers = append(headers, "Parent")
 	}
+	headers = append(headers, "Status", "Notes")
+	markdown += "\n\n| " + strings.Join(headers, " | ") + " |\n|"
+	for _, header := range headers {
+		markdown += strings.Repeat("-", len(header)+2) + "|"
+	}
+	cell := formats.EscapeMarkdownTableCell
 	for _, actions := range curated {
 		for _, action := range actions.Actions {
-			cell := formats.EscapeMarkdownTableCell
+			cells := []string{cell(action.Action), cell(action.Ref)}
 			if withParent {
-				markdown += fmt.Sprintf("\n| %s | %s | %s | %s | %s |", cell(action.Action), cell(action.Ref), cell(action.Parent), cell(action.Status), cell(action.Notes))
-				continue
+				cells = append(cells, cell(action.Parent))
 			}
-			markdown += fmt.Sprintf("\n| %s | %s | %s | %s |", cell(action.Action), cell(action.Ref), cell(action.Status), cell(action.Notes))
+			cells = append(cells, cell(action.Status), cell(action.Notes))
+			markdown += "\n| " + strings.Join(cells, " | ") + " |"
 		}
 	}
-	markdown += formats.RenderActionsException(curated)
+	if caveat := formats.RenderActionsException(curated); caveat != "" {
+		// A markdown table ends only at a blank line; without one the caveat renders as a table row.
+		markdown += "\n" + caveat
+	}
 	markdown = "\n" + DetailsOpenWithSummary.Format("🔒 GitHub Actions Curation", markdown)
 	return
 }

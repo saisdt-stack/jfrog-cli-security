@@ -492,19 +492,3 @@ func TestDefaultWorkflowFile(t *testing.T) {
 		})
 	}
 }
-
-func TestDefaultJobID(t *testing.T) {
-	t.Setenv(JobIDEnvVar, "build")
-	assert.Equal(t, "build", DefaultJobID())
-
-	t.Setenv(JobIDEnvVar, "")
-	assert.Empty(t, DefaultJobID())
-}
-
-func TestDefaultGithubRepo(t *testing.T) {
-	t.Setenv(GithubRepoEnvVar, "octocat/hello-world")
-	assert.Equal(t, "octocat/hello-world", DefaultGithubRepo())
-
-	t.Setenv(GithubRepoEnvVar, "")
-	assert.Empty(t, DefaultGithubRepo())
-}

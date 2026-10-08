@@ -41,6 +41,8 @@ import (
 	"github.com/jfrog/jfrog-client-go/utils/log"
 	"github.com/urfave/cli"
 
+	"github.com/jfrog/jfrog-cli-security/commands/curation/githubactions"
+	"github.com/jfrog/jfrog-cli-security/commands/curation/runnerhook"
 	"github.com/jfrog/jfrog-cli-security/commands/enrich"
 	"github.com/jfrog/jfrog-cli-security/commands/sast_server"
 	"github.com/jfrog/jfrog-cli-security/commands/source_mcp"
@@ -133,8 +135,9 @@ func getAuditAndScansCommands() []components.Command {
 			Action:        CurationCmd,
 		},
 		{
-			// Hidden until Catalog/Artifactory add support for VCS package type for GitHub Actions. Until then the
-			// curation decision is a stand-in, so the command must not be discoverable to users.
+			// Hidden until Artifactory curates the VCS package type and the curation service exposes the
+			// GitHub-repository -> VCS-repository mapping. Until then the repository resolver is a stand-in and a
+			// download is not yet a policy decision, so the command must not be discoverable to users.
 			Name:          "curate-gh-actions",
 			Flags:         flags.GetCommandFlags(flags.CurationActions),
 			Description:   curationActionsDocs.GetDescription(),
@@ -658,11 +661,137 @@ func CurationCmd(c *components.Context) error {
 	return progressbar.ExecWithProgress(curationAuditCommand)
 }
 
-// CurationActionsCmd curates the GitHub Actions resolved on this job's runner.
+type curationActionsRunMode int
+
+const (
+	curateAsStep curationActionsRunMode = iota
+	curateAsHook
+	curateFromPre
+	curateFromPost
+	installHook
+	uninstallHook
+)
+
+// curationActionsMode picks what one invocation of curate-gh-actions does from its flags.
+// --trust-action-cache only means something to the hook, so it is accepted only when installing the
+// hook, which pins it into the hook script, and when running as the hook. --from-pre and --from-post
+// find the runner themselves, from the step's process tree, so they take no runner flag.
+func curationActionsMode(runnerHook, install, uninstall, fromPre, fromPost, trustActionCache bool, runnerDir string) (curationActionsRunMode, error) {
+	set := 0
+	for _, b := range []bool{runnerHook, install, uninstall} {
+		if b {
+			set++
+		}
+	}
+	if fromPost {
+		if set > 0 || fromPre || trustActionCache || runnerDir != "" {
+			return curateAsStep, errorutils.CheckErrorf("--%s cannot be set with --%s, --%s, --%s, --%s, --%s or --%s",
+				flags.FromPost, flags.FromPre, flags.RunnerDir, flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook, flags.TrustActionCache)
+		}
+		return curateFromPost, nil
+	}
+	if fromPre && (set > 0 || runnerDir != "") {
+		return curateAsStep, errorutils.CheckErrorf("--%s cannot be set with --%s, --%s, --%s or --%s",
+			flags.FromPre, flags.RunnerDir, flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook)
+	}
+	if set > 1 {
+		return curateAsStep, errorutils.CheckErrorf("only one of --%s, --%s and --%s can be set",
+			flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook)
+	}
+	if trustActionCache && !runnerHook && !install {
+		return curateAsStep, errorutils.CheckErrorf("--%s can only be set with --%s", flags.TrustActionCache, flags.InstallRunnerHook)
+	}
+	if set == 1 && runnerDir == "" {
+		return curateAsStep, errorutils.CheckErrorf("--%s is required with --%s, --%s or --%s",
+			flags.RunnerDir, flags.RunnerHook, flags.InstallRunnerHook, flags.UninstallRunnerHook)
+	}
+	switch {
+	case runnerHook:
+		return curateAsHook, nil
+	case install:
+		return installHook, nil
+	case uninstall:
+		return uninstallHook, nil
+	case fromPre:
+		return curateFromPre, nil
+	default:
+		return curateAsStep, nil
+	}
+}
+
+// CurationActionsCmd curates the GitHub Actions resolved on this job's runner, or installs or removes
+// the check as a self-hosted runner's job-started hook.
 func CurationActionsCmd(c *components.Context) error {
-	// No flags: every input comes from the runner environment. The setters the command
-	// exposes are for tests, which construct it directly rather than through the CLI.
-	return curation.NewCurationActionsCommand().Run()
+	runnerDir := c.GetStringFlagValue(flags.RunnerDir)
+	mode, err := curationActionsMode(c.GetBoolFlagValue(flags.RunnerHook), c.GetBoolFlagValue(flags.InstallRunnerHook),
+		c.GetBoolFlagValue(flags.UninstallRunnerHook), c.GetBoolFlagValue(flags.FromPre), c.GetBoolFlagValue(flags.FromPost),
+		c.GetBoolFlagValue(flags.TrustActionCache), runnerDir)
+	if err != nil {
+		return err
+	}
+	switch mode {
+	case installHook:
+		return installCurationActionsHook(c, runnerDir)
+	case uninstallHook:
+		if err = runnerhook.Uninstall(runnerDir); err != nil {
+			return err
+		}
+		log.Info("Removed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
+		return nil
+	default: // curateAsStep, curateAsHook, curateFromPre, curateFromPost
+		threads, err := pluginsCommon.GetThreadsCount(c)
+		if err != nil {
+			return err
+		}
+		serverDetails, err := pluginsCommon.CreateServerDetailsWithConfigOffer(c, true, cliutils.Rt)
+		if err != nil {
+			return err
+		}
+		if err = curation.RequireArtifactoryServer(serverDetails); err != nil {
+			return err
+		}
+		cmd := curation.NewCurationActionsCommand().SetServerDetails(serverDetails).SetParallelRequests(threads)
+		if mode == curateAsHook {
+			cmd.SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "").SetTrustActionCache(c.GetBoolFlagValue(flags.TrustActionCache))
+		}
+		cmd.SetFromPre(mode == curateFromPre).SetFromPost(mode == curateFromPost)
+		return cmd.Run()
+	}
+}
+
+// installCurationActionsHook installs curate-gh-actions as the job-started hook of the runner in runnerDir.
+func installCurationActionsHook(c *components.Context, runnerDir string) error {
+	jfPath, err := os.Executable()
+	if err != nil {
+		return errorutils.CheckError(err)
+	}
+	homeDir, err := coreutils.GetJfrogHomeDir()
+	if err != nil {
+		return err
+	}
+	serverID := c.GetStringFlagValue(flags.ServerId)
+	// With nothing configured this returns an empty server rather than an error, so check the URL.
+	details, err := coreConfig.GetSpecificConfig(serverID, true, false)
+	if err != nil {
+		return fmt.Errorf("no JFrog server %q is configured - run 'jf config add' first: %w", serverID, err)
+	}
+	if err = curation.RequireArtifactoryServer(details); err != nil {
+		return err
+	}
+	threads, err := pluginsCommon.GetThreadsCount(c)
+	if err != nil {
+		return err
+	}
+	warnings, err := runnerhook.Install(runnerhook.InstallOptions{RunnerDir: runnerDir, JfPath: jfPath, JfrogHomeDir: homeDir, ServerID: serverID, Threads: threads,
+		TrustActionCache: c.GetBoolFlagValue(flags.TrustActionCache)})
+	if err != nil {
+		return err
+	}
+	for _, warning := range warnings {
+		log.Warn(warning)
+	}
+	log.Info("Installed the curate-gh-actions job-started hook. It takes effect the next time the runner starts - restart the runner service if it is already running.")
+	return nil
 }
 
 var supportedCommandsForPostInstallationFailure = datastructures.MakeSetFromElements[string](

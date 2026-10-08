@@ -1,0 +1,256 @@
+package githubactions
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/jfrog/jfrog-cli-core/v2/utils/config"
+	"github.com/jfrog/jfrog-client-go/utils/log"
+)
+
+const resolvedSHANotePrefix = "resolved SHA: "
+
+// contentMismatchNote opens the Notes of an action whose runner copy is not the content Artifactory
+// approved. Kept verbatim so it can be searched for.
+const contentMismatchNote = "not able to decide since content is mismatched"
+
+// unpairedLoggedCommitNote ends the Notes of a logged commit no _actions folder was paired with, so the
+// reader knows the row is a commit, not a folder of the runner.
+const unpairedLoggedCommitNote = "unpaired logged commit"
+
+// spoolPattern names the temp file a downloaded archive is saved to while it is compared.
+const spoolPattern = "jfrog-curation-action-*.tar.gz"
+
+type artifactoryActionCurationDecider struct {
+	client *vcsClient
+}
+
+// NewArtifactoryActionCurationDecider returns a decider that downloads each action through the
+// Artifactory VCS repository - a successful download is the curation approval - and checks that the
+// runner's copy is the content Artifactory served.
+func NewArtifactoryActionCurationDecider(serverDetails *config.ServerDetails) (ActionCurationDecider, error) {
+	client, err := newVCSClient(serverDetails, vcsHTTPRequestTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return &artifactoryActionCurationDecider{client: client}, nil
+}
+
+// Decide classifies ref, downloads it from artifactoryVcsRepo, and compares the served archive with
+// the runner's copy at ref.Path, which is only ever read.
+//
+// The runner keeps no record of the commit it downloaded, so the comparison is what proves the
+// runner holds the approved version: Approved when they are identical, Rejected with
+// contentMismatchNote when they are not - the runner and Artifactory resolved a moving tag or branch
+// to different commits. A curation block is Rejected with Artifactory's reason. A mismatch is a
+// verdict, not an error, so the other actions are still decided.
+//
+// Three paths. When the runner's own logs name the commit and ref.Verification is VerifyLoggedSHA,
+// decideRunnerCommit decides that commit and nothing is compared; an unpaired logged commit (see
+// ActionRef.Unpaired) always takes this path and says so in its Notes. When the logs name a commit but
+// the log is not trusted (the zero Verification), the runner's copy is compared with that commit's
+// archive and the ref is not resolved again. With no logged commit the ref is resolved and compared.
+//
+// A ref with ref.LoggedSHAs whose tag or branch resolves, through the refs list, to one of those
+// commits is decided like the first path: the commit is the runner's, so nothing is compared.
+//
+// Owner and Repo are matched case-insensitively. The ref is case-sensitive; only a full object ID
+// is lower-cased.
+func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifactoryVcsRepo string, ref ActionRef) (ActionCurationResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ActionCurationResult{}, err
+	}
+	owner, repo := strings.ToLower(ref.Owner), strings.ToLower(ref.Repo)
+	switch {
+	case ref.RunnerSHA != "" && ref.Verification == VerifyLoggedSHA:
+		result, err := d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.RunnerSHA)
+		if err == nil && ref.Unpaired() {
+			result.Notes += "; " + unpairedLoggedCommitNote
+		}
+		return result, err
+	case ref.RunnerSHA != "":
+		return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref,
+			ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref.RunnerSHA)})
+	}
+
+	var adv *RefAdvertisement
+	if NeedsRefs(ref.Ref) {
+		var err error
+		if adv, err = d.client.GetRefs(artifactoryVcsRepo, owner, repo); err != nil {
+			return ActionCurationResult{}, fmt.Errorf("reading the git refs of %s/%s: %w", owner, repo, err)
+		}
+	}
+	resolved, err := ClassifyRef(ref.Ref, adv)
+	if err != nil {
+		return ActionCurationResult{}, err
+	}
+
+	if commit, ok := loggedCommitOf(ref, adv, resolved); ok {
+		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, commit)
+	}
+	return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref, resolved)
+}
+
+// loggedCommitOf returns the commit resolved names when it is one of ref.LoggedSHAs: that commit is
+// then the one the runner fetched, whatever the folder holds. A tag that has moved, or a ref the
+// advertisement cannot resolve to a commit, pairs with nothing and is not a mismatch.
+func loggedCommitOf(ref ActionRef, adv *RefAdvertisement, resolved ResolvedRef) (string, bool) {
+	if len(ref.LoggedSHAs) == 0 || adv == nil {
+		return "", false
+	}
+	commit := strings.ToLower(resolved.APIRef)
+	switch resolved.Kind {
+	case RefKindTag:
+		commit, _ = adv.Commit(tagsPrefix + resolved.APIRef)
+	case RefKindBranch:
+		commit, _ = adv.Commit(headsPrefix + resolved.APIRef)
+	}
+	if commit == "" {
+		return "", false
+	}
+	return commit, slices.ContainsFunc(ref.LoggedSHAs, func(sha string) bool { return strings.EqualFold(sha, commit) })
+}
+
+// compareAtCommit downloads resolved and compares the archive with the runner's copy at ref.Path,
+// which is only ever read.
+func (d *artifactoryActionCurationDecider) compareAtCommit(artifactoryVcsRepo, owner, repo string, ref ActionRef, resolved ResolvedRef) (ActionCurationResult, error) {
+	body, filename, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
+	var blocked *BlockedError
+	if errors.As(err, &blocked) {
+		// A block serves no archive to read the commit from, so the commit is named only when the
+		// request named it - the verdict is then on that exact commit. A tag or branch is resolved by
+		// Artifactory, and which commit it chose is not reported.
+		sha := ""
+		if resolved.Kind == RefKindCommit {
+			sha = resolved.APIRef
+		}
+		return ActionCurationResult{Status: ActionRejected, Notes: blockedNotes(blocked.Reason, sha)}, nil
+	}
+	if err != nil {
+		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
+	}
+	// Spooled rather than compared from the body, so the request's timeout covers the download alone
+	// and a download failure is not mistaken for a comparison failure.
+	archivePath, err := spoolArchive(body)
+	if err != nil {
+		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
+	}
+	defer removeSpool(archivePath)
+
+	started := time.Now()
+	comparison, err := CompareArchive(archivePath, ref.Path)
+	if err != nil {
+		return ActionCurationResult{}, fmt.Errorf("comparing the approved %s %q with the runner's copy at %q: %w",
+			resolved.Kind, resolved.APIRef, ref.Path, err)
+	}
+	sha := resolvedSHA(filename, comparison.PaxSHA)
+	log.Debug(fmt.Sprintf("github-actions curation: %s/%s@%s via %q as %s %q, resolved SHA %q: runner copy at %q identical=%t, first difference %q, compared in %s",
+		owner, repo, ref.Ref, artifactoryVcsRepo, resolved.Kind, resolved.APIRef, sha, ref.Path,
+		comparison.Identical, comparison.FirstDifference, time.Since(started)))
+
+	if !comparison.Identical {
+		return ActionCurationResult{Status: ActionRejected, Notes: mismatchNotes(comparison, sha) + verifiedByContentNote(ref)}, nil
+	}
+	result := ActionCurationResult{Status: ActionApproved}
+	if sha != "" {
+		result.Notes = resolvedSHANotePrefix + sha
+	}
+	result.Notes += verifiedByContentNote(ref)
+	return result, nil
+}
+
+// verifiedByContentNote is the Notes suffix that tells the reader the runner's copy was compared
+// although its log named a commit, with the short code saying why. The full reasons are in the job's
+// one warning, so a long string never lands in every row.
+func verifiedByContentNote(ref ActionRef) string {
+	if ref.ContentReason == "" {
+		return ""
+	}
+	return "; verified by content: " + ref.ContentReason
+}
+
+// decideRunnerCommit is the fast path, valid only for a log whose trust has been assessed. It decides
+// the exact commit the runner's logs say it fetched, so no ref is looked up and the runner's copy is
+// not compared: the commit identifies the content, and the runner's action cache is the admin's,
+// trusted to hold what its SHA names.
+//
+// Because the request names the commit, curation audit records this action by its SHA,
+// not by the tag or branch the workflow wrote.
+func (d *artifactoryActionCurationDecider) decideRunnerCommit(artifactoryVcsRepo, owner, repo, sha string) (ActionCurationResult, error) {
+	resolved := ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(sha)}
+	body, _, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
+	var blocked *BlockedError
+	if errors.As(err, &blocked) {
+		return ActionCurationResult{Status: ActionRejected, Notes: blockedNotes(blocked.Reason, resolved.APIRef)}, nil
+	}
+	if err != nil {
+		return ActionCurationResult{}, fmt.Errorf("downloading %s %q: %w", resolved.Kind, resolved.APIRef, err)
+	}
+	closeResponseBody(body)
+	return ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + resolved.APIRef}, nil
+}
+
+// spoolArchive saves body to a temp file and closes both, returning the file's path.
+func spoolArchive(body io.ReadCloser) (string, error) {
+	defer closeResponseBody(body)
+	spool, err := os.CreateTemp("", spoolPattern)
+	if err != nil {
+		return "", fmt.Errorf("creating a temp file for the action archive: %w", err)
+	}
+	_, copyErr := io.Copy(spool, body)
+	// Closed before any removal: Windows cannot remove an open file.
+	if err = errors.Join(copyErr, spool.Close()); err != nil {
+		removeSpool(spool.Name())
+		return "", fmt.Errorf("saving the action archive: %w", err)
+	}
+	return spool.Name(), nil
+}
+
+func removeSpool(path string) {
+	if err := os.Remove(path); err != nil {
+		log.Warn(fmt.Sprintf("github-actions curation: removing the downloaded action archive %q: %v", path, err))
+	}
+}
+
+// resolvedSHA picks the commit to report. The archive's pax header wins: it always names the commit,
+// while the filename of an annotated tag's archive can name the tag object instead.
+func resolvedSHA(filename, paxSHA string) string {
+	filenameSHA := ExtractResolvedSHA(filename)
+	if paxSHA != "" && filenameSHA != "" && paxSHA != filenameSHA {
+		log.Debug(fmt.Sprintf("github-actions curation: archive %q names %s, its pax header names %s; reporting the header's",
+			filename, filenameSHA, paxSHA))
+	}
+	if paxSHA != "" {
+		return paxSHA
+	}
+	return filenameSHA
+}
+
+// blockedNotes is the Notes of an action curation blocked, naming sha when it is known.
+func blockedNotes(reason, sha string) string {
+	if sha == "" {
+		return reason
+	}
+	return reason + "; " + resolvedSHANotePrefix + sha
+}
+
+func mismatchNotes(comparison ArchiveComparison, sha string) string {
+	detail := "differs"
+	switch {
+	case comparison.Missing:
+		detail = "missing on the runner"
+	case comparison.Extra:
+		detail = "only on the runner"
+	}
+	notes := fmt.Sprintf("%s (%s %s)", contentMismatchNote, comparison.FirstDifference, detail)
+	if sha != "" {
+		notes += "; " + resolvedSHANotePrefix + sha
+	}
+	return notes
+}

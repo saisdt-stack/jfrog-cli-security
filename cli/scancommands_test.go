@@ -22,6 +22,7 @@ import (
 	flags "github.com/jfrog/jfrog-cli-security/cli/docs"
 	"github.com/jfrog/jfrog-cli-security/utils/techutils"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var TestDataDir = filepath.Join("..", "tests", "testdata")
@@ -202,6 +203,51 @@ func TestEffectiveIncludeViolations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, EffectiveIncludeViolations(tt.violationsFlag, tt.projectProvided))
+		})
+	}
+}
+
+func TestCurationActionsMode(t *testing.T) {
+	tests := []struct {
+		name                       string
+		runnerHook, install, unins bool
+		fromPre, fromPost          bool
+		trustActionCache           bool
+		runnerDir                  string
+		want                       curationActionsRunMode
+		wantErr                    string
+	}{
+		{name: "verify when no flag is set then it runs as a step", want: curateAsStep},
+		{name: "verify when runner-hook is set with a runner dir then it runs as the hook", runnerHook: true, runnerDir: "/r", want: curateAsHook},
+		{name: "verify when runner-hook is set without a runner dir then it fails", runnerHook: true, wantErr: "--runner-dir"},
+		{name: "verify when install is set with a runner dir then it installs", install: true, runnerDir: "/r", want: installHook},
+		{name: "verify when uninstall is set with a runner dir then it uninstalls", unins: true, runnerDir: "/r", want: uninstallHook},
+		{name: "verify when two modes are set then it fails", install: true, runnerHook: true, runnerDir: "/r", wantErr: "only one of"},
+		{name: "verify when trust-action-cache is set with install then it installs", install: true, trustActionCache: true, runnerDir: "/r", want: installHook},
+		{name: "verify when trust-action-cache is set with runner-hook then it runs as the hook", runnerHook: true, trustActionCache: true, runnerDir: "/r", want: curateAsHook},
+		{name: "verify when trust-action-cache is set without a hook flag then it fails", trustActionCache: true, wantErr: "--trust-action-cache"},
+		{name: "verify when from-pre is set alone then it curates from the pre", fromPre: true, want: curateFromPre},
+		{name: "verify when from-pre is set with a runner dir then it fails", fromPre: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with runner-hook then it fails", fromPre: true, runnerHook: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with trust-action-cache then it fails", fromPre: true, trustActionCache: true, wantErr: "--trust-action-cache"},
+		{name: "verify when from-post is set alone then it reports from the post", fromPost: true, want: curateFromPost},
+		{name: "verify when from-post is set with from-pre then it fails", fromPost: true, fromPre: true, wantErr: "--from-post"},
+		{name: "verify when from-post is set with a runner dir then it fails", fromPost: true, runnerDir: "/r", wantErr: "--from-post"},
+		{name: "verify when from-post is set with runner-hook then it fails", fromPost: true, runnerHook: true, wantErr: "--from-post"},
+		{name: "verify when from-post is set with install then it fails", fromPost: true, install: true, wantErr: "--from-post"},
+		{name: "verify when from-post is set with uninstall then it fails", fromPost: true, unins: true, wantErr: "--from-post"},
+		{name: "verify when from-post is set with trust-action-cache then it fails", fromPost: true, trustActionCache: true, wantErr: "--from-post"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.fromPre, tt.fromPost, tt.trustActionCache, tt.runnerDir)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

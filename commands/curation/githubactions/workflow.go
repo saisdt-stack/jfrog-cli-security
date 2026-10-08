@@ -249,6 +249,9 @@ func CrossReference(discovered []ActionRef, used JobUses) ([]ActionRef, []LocalU
 	// overwrites Parent - but the location that reference was found at is still merged into
 	// Subpaths and scanned, since attribution and "what still needs reading" are separate guards.
 	hasParent := map[string]bool{}
+	// direct marks the keys the job itself uses. One of them that a composite also pulls in names
+	// that composite too, so a reader does not take the row for a purely direct dependency.
+	direct := map[string]bool{}
 
 	// pending pairs a key with the locations newly discovered for it this round, so the round
 	// loop below only re-reads metadata that is actually new.
@@ -270,6 +273,7 @@ func CrossReference(discovered []ActionRef, used JobUses) ([]ActionRef, []LocalU
 	for _, u := range used.Remote {
 		key := refKey(u.Owner, u.Repo, u.Ref)
 		hasParent[key] = true // directly used by the job itself - no Parent to attribute
+		direct[key] = true
 		isNew := markLocation(key, u.Subpath)
 		if idx, ok := byKey[key]; ok && isNew && u.Subpath != "" {
 			discovered[idx].Subpaths = append(discovered[idx].Subpaths, u.Subpath)
@@ -306,9 +310,12 @@ func CrossReference(discovered []ActionRef, used JobUses) ([]ActionRef, []LocalU
 					if !ok {
 						continue
 					}
-					if !hasParent[childKey] {
+					switch {
+					case !hasParent[childKey]:
 						discovered[childIdx].Parent = parentIdentity
 						hasParent[childKey] = true
+					case direct[childKey] && discovered[childIdx].Parent == "" && !pulledInBy(discovered, byKey, parentIdx, childKey):
+						discovered[childIdx].Parent = directAlsoViaPrefix + parentIdentity
 					}
 					isNew := markLocation(childKey, cu.Subpath)
 					if isNew && cu.Subpath != "" {
@@ -323,6 +330,30 @@ func CrossReference(discovered []ActionRef, used JobUses) ([]ActionRef, []LocalU
 		frontier = nextFrontier
 	}
 	return discovered, localUses
+}
+
+// directAlsoViaPrefix opens the Parent of an action the job uses directly that a composite action
+// also pulls in.
+const directAlsoViaPrefix = "direct; also via "
+
+// pulledInBy reports whether the action at idx was itself attributed to key, at any depth: a cycle
+// back to an action the job uses directly, whose composite therefore adds nothing worth naming.
+func pulledInBy(discovered []ActionRef, byKey map[string]int, idx int, key string) bool {
+	for range discovered {
+		parent := discovered[idx].Parent
+		if parent == "" || strings.HasPrefix(parent, directAlsoViaPrefix) {
+			return false
+		}
+		if parent == key {
+			return true
+		}
+		next, ok := byKey[parent]
+		if !ok {
+			return false
+		}
+		idx = next
+	}
+	return false
 }
 
 func refKey(owner, repo, ref string) string {

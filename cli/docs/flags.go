@@ -169,6 +169,14 @@ const (
 	RunNative             = "run-native"
 	MvnIncludePluginDeps  = "mvn-include-plugin-deps"
 	Script                = "script"
+	ActionsThreads        = "actions-" + Threads
+	RunnerHook            = "runner-hook"
+	RunnerDir             = "runner-dir"
+	InstallRunnerHook     = "install-runner-hook"
+	UninstallRunnerHook   = "uninstall-runner-hook"
+	TrustActionCache      = "trust-action-cache"
+	FromPre               = "from-pre"
+	FromPost              = "from-post"
 
 	// Unique git flags
 	gitPrefix       = "git-"
@@ -235,8 +243,7 @@ var commandFlags = map[string][]string{
 	CurationAudit: {
 		CurationOutput, WorkingDirs, Threads, RequirementsFile, InsecureTls, useWrapperAudit, UseIncludedBuilds, SolutionPath, DockerImageName, HuggingFaceModel, IncludeCachedPackages, MvnIncludePluginDeps, LegacyPeerDeps, RunNative, Script,
 	},
-	// curate-gh-actions takes every input from the runner environment; it has no flags.
-	CurationActions: {},
+	CurationActions: {ActionsThreads, ServerId, RunnerDir, InstallRunnerHook, UninstallRunnerHook, RunnerHook, TrustActionCache, FromPre, FromPost},
 	GitCountContributors: {
 		InputFile, ScmType, ScmApiUrl, Token, Owner, RepoName, Months, DetailedSummary, InsecureTls, GitThreads, CacheValidity,
 	},
@@ -361,6 +368,14 @@ var flagsMap = map[string]components.Flag{
 	LegacyPeerDeps:                components.NewBoolFlag(LegacyPeerDeps, "[npm] Pass --legacy-peer-deps to npm install to bypass peer-dependency version conflicts."),
 	RunNative:                     components.NewBoolFlag(RunNative, "[npm] Use the native npm client for dependency resolution. Reads Artifactory URL and repository from the project's .npmrc registry — no 'jf npm-config' required. Respects .npmrc and Volta configuration."),
 	Script:                        components.NewStringFlag(Script, "[uv] Path to a PEP 723 inline-script .py file to audit standalone, instead of scanning the working directory for a pyproject.toml/uv.lock project."),
+	ActionsThreads:                components.NewStringFlag(Threads, "The number of GitHub Actions curated in parallel.", components.WithIntDefaultValue(cliutils.Threads)),
+	RunnerHook:                    components.NewBoolFlag(RunnerHook, "Run as a self-hosted runner's job-started hook. Set by the script --install-runner-hook writes.", components.SetHiddenBoolFlag()),
+	FromPre:                       components.NewBoolFlag(FromPre, "Run from the pre script of the action that wraps this command, which must be the job's first step. Set by that action.", components.SetHiddenBoolFlag()),
+	FromPost:                      components.NewBoolFlag(FromPost, "Run from the post script of the action that wraps this command, to report the actions the runner fetched after its pre. Set by that action.", components.SetHiddenBoolFlag()),
+	RunnerDir:                     components.NewStringFlag(RunnerDir, "The self-hosted runner's installation directory (the one holding config.sh, or config.cmd on Windows)."),
+	InstallRunnerHook:             components.NewBoolFlag(InstallRunnerHook, "Install this command as the job-started hook of the self-hosted runner in --runner-dir. A runner-admin operation, refused inside a job. If the runner already has a job-started hook, its .env is left as is and you are told the line to add to that hook. If the runner is already running, restart it afterwards."),
+	UninstallRunnerHook:           components.NewBoolFlag(UninstallRunnerHook, "Remove the job-started hook installed by --install-runner-hook from the runner in --runner-dir. Refused while another job-started hook still calls it. If the runner is already running, restart it afterwards."),
+	TrustActionCache:              components.NewBoolFlag(TrustActionCache, "With --install-runner-hook: let the hook decide an action the runner loaded from its action archive cache (ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE) by the commit it logged, even when the runner's user owns or can write that cache. Without it, such an action is compared by content unless the cache is owned by another user and read-only to that user. For an administrator who keeps the cache read-only, or accepts that a job on the same user could also edit the hook."),
 	binarySca:                     components.NewBoolFlag(Sca, fmt.Sprintf("Selective scanners mode: Execute SCA (Software Composition Analysis) sub-scan. Use --%s to run both SCA and Contextual Analysis. Use --%s --%s to to run SCA. Can be combined with --%s.", Sca, Sca, WithoutCA, Secrets)),
 	binarySecrets:                 components.NewBoolFlag(Secrets, fmt.Sprintf("Selective scanners mode: Execute Secrets sub-scan. Can be combined with --%s.", Sca)),
 	binaryWithoutCA:               components.NewBoolFlag(WithoutCA, fmt.Sprintf("Selective scanners mode: Disable Contextual Analysis scanner after SCA. Relevant only with --%s flag.", Sca)),
