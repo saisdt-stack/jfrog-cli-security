@@ -37,12 +37,18 @@ type CurationActionsCommand struct {
 	runnerDir        string
 	callerMode       githubactions.CallerMode
 	self             string
+	githubHosted     bool
 	trustActionCache bool
+	fromPre          bool
+	// runnerDirFinder walks the process tree to the runner under --from-pre; a test sets a fake, since
+	// on a GitHub runner the test process itself descends from the Worker. nil finds no runner.
+	runnerDirFinder func() (string, error)
 }
 
 func NewCurationActionsCommand() *CurationActionsCommand {
 	return &CurationActionsCommand{
 		vcsRepoResolver: githubactions.NewMockArtifactoryVcsRepoResolver(),
+		runnerDirFinder: githubactions.DetectRunnerDir,
 	}
 }
 
@@ -138,16 +144,29 @@ func (c *CurationActionsCommand) SetTrustActionCache(trust bool) *CurationAction
 	return c
 }
 
+// SetFromPre is --from-pre: the command runs in the pre script of the action wrapping it, finds the
+// runner from its own process tree, and reads the runner's logs as githubactions.ModePre.
+func (c *CurationActionsCommand) SetFromPre(fromPre bool) *CurationActionsCommand {
+	c.fromPre = fromPre
+	return c
+}
+
 // discovererFor returns the discoverer Run uses for actionsCacheDir.
-func (c *CurationActionsCommand) discovererFor(actionsCacheDir string) actionDiscoverer {
+func (c *CurationActionsCommand) discovererFor(actionsCacheDir string) (actionDiscoverer, error) {
 	switch {
 	case c.discoverer != nil:
-		return c.discoverer
-	case c.readsRunnerLogs():
+		return c.discoverer, nil
+	case c.readsRunnerLogs() && c.runnerDir != "":
 		return runnerLogDiscoverer{runnerDir: c.runnerDir, actionsCacheDir: actionsCacheDir, mode: c.callerMode, self: c.self,
-			trustActionCache: c.trustActionCache}
+			githubHosted: c.githubHosted, trustActionCache: c.trustActionCache}, nil
+	case c.callerMode == githubactions.ModePre:
+		// A pre that could not find the runner: no log names a SHA, so every action is compared by content.
+		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir, contentReason: githubactions.ReasonNoSHA}, nil
+	case c.readsRunnerLogs():
+		// The hook is told where its runner is; without that it has nothing it was installed to read.
+		return nil, errorutils.CheckErrorf("the job-started hook needs the runner directory")
 	default:
-		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir}
+		return cacheWalkDiscoverer{actionsCacheDir: actionsCacheDir}, nil
 	}
 }
 
@@ -185,7 +204,14 @@ func (c *CurationActionsCommand) Run() (err error) {
 		}
 	}
 
-	discovered, err := c.discovererFor(actionsCacheDir).Discover()
+	if c.fromPre {
+		c.locateRunnerFromPre()
+	}
+	discoverer, err := c.discovererFor(actionsCacheDir)
+	if err != nil {
+		return err
+	}
+	discovered, err := discoverer.Discover()
 	if err != nil {
 		return err
 	}
@@ -234,6 +260,31 @@ func (c *CurationActionsCommand) Run() (err error) {
 	}
 
 	return errors.Join(outcome.decideErr(), notApprovedError(outcome.decidedRows()))
+}
+
+// locateRunnerFromPre sets up a --from-pre run: the mode, the running action and the runner, found from
+// this process's tree unless SetRunnerDir named it. Both variables are the runner's own in a pre, which
+// the workflow cannot override; an empty GITHUB_ACTION_REPOSITORY leaves the job unproven, so it is
+// verified by content. A runner that cannot be found is not an error: the action cache is still curated.
+func (c *CurationActionsCommand) locateRunnerFromPre() {
+	c.callerMode = githubactions.ModePre
+	c.self = os.Getenv(githubactions.ActionRepositoryEnvVar)
+	c.githubHosted = os.Getenv(githubactions.RunnerEnvironmentEnvVar) == "github-hosted"
+	if c.runnerDir != "" {
+		return
+	}
+	find := c.runnerDirFinder
+	if find == nil {
+		find = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
+	}
+	dir, err := find()
+	if err != nil {
+		log.Warn("Cannot find the runner from this step's process tree, so its logs cannot name the SHA of any action - " +
+			"curating the action cache, every action by content: " + githubactions.QuoteForLog(err.Error()))
+		return
+	}
+	log.Debug(fmt.Sprintf("github-actions curation: the runner directory is %q", dir))
+	c.runnerDir = dir
 }
 
 // notApprovedError fails the gate unless every row is Approved. A decider that returns any status other than Approved,

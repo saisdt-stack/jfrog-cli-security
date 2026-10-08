@@ -2,6 +2,7 @@ package curation
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"maps"
 	"net/http"
@@ -861,4 +862,92 @@ func TestCurationActionsCommand_Run_HookModeForgedSetupLineCannotApproveAnEvilCo
 	assert.Contains(t, report, "| aa/aa | "+testShaEvil+" | Approved | resolved SHA: "+testShaEvil+"; unpaired logged commit |")
 	require.Error(t, err, "the evil copy must fail the gate")
 	assert.ErrorContains(t, err, "aa/aa@v1")
+}
+
+// refRecorder approves every action and records the refs it was asked to decide, so a test sees how
+// each one was to be verified.
+type refRecorder struct {
+	mu   sync.Mutex
+	refs []githubactions.ActionRef
+}
+
+func (r *refRecorder) Decide(_ context.Context, _ string, ref githubactions.ActionRef) (githubactions.ActionCurationResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.refs = append(r.refs, ref)
+	return githubactions.ActionCurationResult{Status: githubactions.ActionApproved}, nil
+}
+
+func TestCurationActionsCommand_Run_FromPreWithAnInvisibleRunnerComparesEveryActionByContent(t *testing.T) {
+	// A container job: the Worker is not in the process tree, so the pre has only the action cache.
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+	summary := filepath.Join(t.TempDir(), "step_summary.md")
+	t.Setenv(stepSummaryEnvVar, summary)
+	spec := runnerSpec{
+		cacheDirs:    []string{"actions/checkout/v4", "jfrog/curate/v1"},
+		workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: jfrog/curate@v1\n      - uses: actions/checkout@v4\n",
+	}
+	decider := &refRecorder{}
+	cmd := spec.newCommand(t, writtenWorkflowFile, "build", decider).SetFromPre(true)
+	cmd.runnerDirFinder = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
+
+	report, err := captureReport(t, cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]refFacts{
+		"actions/checkout@v4": {Reason: githubactions.ReasonNoSHA},
+		"jfrog/curate@v1":     {Reason: githubactions.ReasonNoSHA},
+	}, factsOf(decider.refs))
+	assert.Contains(t, report, "not visible")
+	assert.NotContains(t, report, "| Parent |", "a pre runs before any checkout, so the workspace's workflow file is not this job's")
+	content, err := os.ReadFile(summary)
+	require.NoError(t, err)
+	assert.Contains(t, string(content), "| actions/checkout | v4 |")
+}
+
+func TestCurationActionsCommand_Run_FromPreAsTheFirstStepDecidesByLoggedSHA(t *testing.T) {
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+	t.Setenv(stepSummaryEnvVar, "")
+	// checkout came from the runner's action cache, which on a GitHub-hosted runner no earlier job wrote.
+	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("jfrog/curate", "actions/checkout"), map[string]string{
+		"pages/a_1.log": setupLine("jfrog", "curate", "v1", testShaSelf) + setupLine("actions", "checkout", "v4", testShaV4),
+		"Worker_20261005-050652-utc.log": workerStart + savedLine("jfrog", "curate", testShaSelf) +
+			cachedLine("actions", "checkout", testShaV4),
+	}, []string{"jfrog/curate/v1", "actions/checkout/v4"})
+	decider := &refRecorder{}
+	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(decider).SetFromPre(true)
+	cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+
+	_, err := captureReport(t, cmd)
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]refFacts{
+		"jfrog/curate@v1":     {SHA: testShaSelf, BySHA: true},
+		"actions/checkout@v4": {SHA: testShaV4, BySHA: true},
+	}, factsOf(decider.refs))
+}
+
+func TestCurationActionsCommand_Run_HookModeWithoutARunnerDirFails(t *testing.T) {
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
+	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetCallerMode(githubactions.ModeHook, "").SetDecider(&scriptedDecider{})
+	_, err := captureReport(t, cmd)
+	assert.ErrorContains(t, err, "runner directory")
+}
+
+func TestCurationActionsCommand_Run_FromPreWithoutAFinderComparesByContent(t *testing.T) {
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+	t.Setenv(stepSummaryEnvVar, "")
+	_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
+	decider := &refRecorder{}
+	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(decider).SetFromPre(true)
+	cmd.runnerDirFinder = nil
+	_, err := captureReport(t, cmd)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]refFacts{"actions/checkout@v4": {Reason: githubactions.ReasonNoSHA}}, factsOf(decider.refs))
 }

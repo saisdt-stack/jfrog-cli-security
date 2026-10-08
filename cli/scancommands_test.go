@@ -211,6 +211,7 @@ func TestCurationActionsMode(t *testing.T) {
 	tests := []struct {
 		name                       string
 		runnerHook, install, unins bool
+		fromPre                    bool
 		trustActionCache           bool
 		runnerDir                  string
 		want                       curationActionsRunMode
@@ -227,10 +228,16 @@ func TestCurationActionsMode(t *testing.T) {
 		{name: "verify when trust-action-cache is set with runner-hook then it runs as the hook", runnerHook: true, trustActionCache: true, runnerDir: "/r", want: curateAsHook},
 		{name: "verify when trust-action-cache is set without a hook flag then it fails", trustActionCache: true, wantErr: "--trust-action-cache"},
 		{name: "verify when trust-action-cache is set with uninstall then it fails", unins: true, trustActionCache: true, runnerDir: "/r", wantErr: "--trust-action-cache"},
+		{name: "verify when from-pre is set alone then it curates from the pre", fromPre: true, want: curateFromPre},
+		{name: "verify when from-pre is set with a runner dir then it fails", fromPre: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with runner-hook then it fails", fromPre: true, runnerHook: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with install then it fails", fromPre: true, install: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with uninstall then it fails", fromPre: true, unins: true, runnerDir: "/r", wantErr: "--from-pre"},
+		{name: "verify when from-pre is set with trust-action-cache then it fails", fromPre: true, trustActionCache: true, wantErr: "--trust-action-cache"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.trustActionCache, tt.runnerDir)
+			got, err := curationActionsMode(tt.runnerHook, tt.install, tt.unins, tt.fromPre, tt.trustActionCache, tt.runnerDir)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)

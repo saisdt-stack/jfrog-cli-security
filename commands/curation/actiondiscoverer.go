@@ -23,6 +23,9 @@ type actionDiscoverer interface {
 // cacheWalkDiscoverer lists the actions by walking the runner's _actions directory.
 type cacheWalkDiscoverer struct {
 	actionsCacheDir string
+	// contentReason, when set, is every ref's ContentReason: why it is compared by content although the
+	// command reads the runner's logs.
+	contentReason string
 }
 
 func (d cacheWalkDiscoverer) Discover() ([]githubactions.ActionRef, error) {
@@ -35,6 +38,9 @@ func (d cacheWalkDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 	}
 	if len(scan.Refs) == 0 {
 		return nil, githubactions.ErrCacheNotReadable()
+	}
+	for i := range scan.Refs {
+		scan.Refs[i].ContentReason = d.contentReason
 	}
 	return scan.Refs, nil
 }
