@@ -72,6 +72,8 @@ type runnerLogDiscoverer struct {
 type jobSeen struct {
 	// facts is what the job message says about the job.
 	facts githubactions.JobFacts
+	// jobParsed is true when the job message was read into facts.
+	jobParsed bool
 	// logsTrusted is true when the trust assessment let the logs decide actions by their SHA.
 	logsTrusted bool
 }
@@ -86,6 +88,7 @@ func (d runnerLogDiscoverer) Discover() ([]githubactions.ActionRef, error) {
 	}
 	if diagErr == nil {
 		seen.facts = snapshot.Job
+		seen.jobParsed = snapshot.JobParsed
 	}
 	if diagErr == nil {
 		if refs, ok := githubactions.RefsFromSetupJob(snapshot.SetupJob, snapshot.Worker, d.actionsCacheDir); ok {

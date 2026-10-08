@@ -14,27 +14,43 @@ const (
 )
 
 func TestParseSetupJobLines(t *testing.T) {
-	text := "2026-10-01T06:57:24.6592950Z Download action repository 'actions/checkout@v4' (SHA:" + shaV4 + ")\n" +
-		"Download action repository 'actions/checkout@v3' (SHA:" + shaV3 + ")\n" +
-		"Download action repository 'actions/setup-node@" + shaNode + "' (SHA:" + shaNode + ")\n" +
-		"Download action repository 'actions/checkout@v4' (SHA:" + shaV4 + ")\n" +
-		"Complete job name: probe\n"
-	assert.Equal(t, []LoggedAction{
-		{Owner: "actions", Repo: "checkout", Ref: "v4", SHA: shaV4},
-		{Owner: "actions", Repo: "checkout", Ref: "v3", SHA: shaV3},
-		{Owner: "actions", Repo: "setup-node", Ref: shaNode, SHA: shaNode},
-	}, ParseSetupJobLines(text))
-}
-
-func TestParseSetupJobLinesNeverSpanALine(t *testing.T) {
-	// The setup line is matched anywhere on a line, so a name broken across lines must not let one
-	// capture carry a newline, and with it a workflow command, into what is printed.
-	for _, text := range []string{
-		"Download action repository 'actions/checkout@v4\n::error::forged' (SHA:" + shaV4 + ")\n",
-		"Download action repository 'actions/check\r\n::error::out@v4' (SHA:" + shaV4 + ")\n",
-		"Download action repository 'act\nions/checkout@v4' (SHA:" + shaV4 + ")\n",
-	} {
-		assert.Empty(t, ParseSetupJobLines(text), "ParseSetupJobLines(%q)", text)
+	tests := []struct {
+		name string
+		text string // the "Set up job" output as the runner buffers it
+		want []LoggedAction
+	}{
+		{
+			name: "verify when the runner names actions then each is returned once in the order named",
+			text: "2026-10-01T06:57:24.6592950Z Download action repository 'actions/checkout@v4' (SHA:" + shaV4 + ")\n" +
+				"Download action repository 'actions/checkout@v3' (SHA:" + shaV3 + ")\n" +
+				"Download action repository 'actions/setup-node@" + shaNode + "' (SHA:" + shaNode + ")\n" +
+				"Download action repository 'actions/checkout@v4' (SHA:" + shaV4 + ")\n" +
+				"Complete job name: probe\n",
+			want: []LoggedAction{
+				{Owner: "actions", Repo: "checkout", Ref: "v4", SHA: shaV4},
+				{Owner: "actions", Repo: "checkout", Ref: "v3", SHA: shaV3},
+				{Owner: "actions", Repo: "setup-node", Ref: shaNode, SHA: shaNode},
+			},
+		},
+		// The line is matched anywhere on a line, so a name broken across lines must not let one capture
+		// carry a newline, and with it a workflow command, into what is printed.
+		{
+			name: "verify when a newline and a workflow command split the ref then nothing is read",
+			text: "Download action repository 'actions/checkout@v4\n::error::forged' (SHA:" + shaV4 + ")\n",
+		},
+		{
+			name: "verify when a CRLF and a workflow command split the repository then nothing is read",
+			text: "Download action repository 'actions/check\r\n::error::out@v4' (SHA:" + shaV4 + ")\n",
+		},
+		{
+			name: "verify when a newline splits the owner then nothing is read",
+			text: "Download action repository 'act\nions/checkout@v4' (SHA:" + shaV4 + ")\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, ParseSetupJobLines(tt.text), "ParseSetupJobLines(%q)", tt.text)
+		})
 	}
 }
 
@@ -136,6 +152,13 @@ func TestParseWorkerLog(t *testing.T) {
 			want: nil,
 		},
 		{
+			// The job message quotes author-controlled text, which may imitate a runner line after indentation.
+			name: "verify when the job message quotes a runner line then it is not read",
+			log: "[2026-10-07 11:03:03Z INFO ActionManager] Check if action archive 'actions/checkout@" + sha40 + "' already exists, in cache dir /opt/actionarchivecache\n" +
+				"      \"script\": \"[2026-10-07 00:00:00Z INFO ActionManager] Check if action archive 'jobmsg/forged@" + sha40b + "' already exists\"",
+			want: []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: sha40, Source: SourceCache, CacheDir: "/opt/actionarchivecache"}},
+		},
+		{
 			name: "verify when the log names no action then nothing is returned",
 			log:  "[2026-10-01 06:43:29Z INFO Worker] Version: 2.337.0\n",
 			want: nil,
@@ -146,13 +169,6 @@ func TestParseWorkerLog(t *testing.T) {
 			assert.Equal(t, tt.want, ParseWorkerLog(tt.log))
 		})
 	}
-}
-
-func TestParseWorkerLogIgnoresTextInTheJobMessage(t *testing.T) {
-	real := "[2026-10-07 11:03:03Z INFO ActionManager] Check if action archive 'actions/checkout@" + sha40 + "' already exists, in cache dir /opt/actionarchivecache"
-	inJobMessage := "      \"script\": \"[2026-10-07 00:00:00Z INFO ActionManager] Check if action archive 'jobmsg/forged@" + sha40b + "' already exists\""
-	got := ParseWorkerLog(real + "\n" + inJobMessage)
-	assert.Equal(t, []WorkerAction{{Owner: "actions", Repo: "checkout", SHA: sha40, Source: SourceCache, CacheDir: "/opt/actionarchivecache"}}, got)
 }
 
 func TestWorkerLogBuildsImage(t *testing.T) {

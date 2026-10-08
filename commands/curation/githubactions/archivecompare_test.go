@@ -137,7 +137,7 @@ func (l runnerLayout) build(t *testing.T) string {
 	for name, target := range l.links {
 		path := filepath.Join(root, filepath.FromSlash(name))
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-		require.NoError(t, os.Symlink(target, path))
+		symlinkOrSkip(t, target, path)
 	}
 	return root
 }
@@ -425,7 +425,7 @@ func TestCompareArchive(t *testing.T) {
 			runnerDir := tt.runner.build(t)
 			if tt.rootIsSymlink {
 				link := filepath.Join(t.TempDir(), "v4")
-				require.NoError(t, os.Symlink(runnerDir, link))
+				symlinkOrSkip(t, runnerDir, link)
 				runnerDir = link
 			}
 

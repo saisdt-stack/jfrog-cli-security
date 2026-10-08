@@ -227,13 +227,15 @@ func (c *CurationActionsCommand) Run() (err error) {
 
 	var used githubactions.JobUses
 	attributed := false
-	// As the hook or in a pre script the job has not checked anything out yet, so a workflow file in
-	// the workspace is a previous run's: attributing from it could name the wrong parents and hide
-	// local actions.
-	if !c.readsRunnerLogs() {
-		if used, attributed, err = c.parseWorkflowUses(workingDir); err != nil {
-			return err
+	if c.readsRunnerLogs() {
+		// As the hook or in a pre script the job has not checked anything out yet, so a workflow file in
+		// the workspace is a previous run's. The job message names this job's own steps instead - inside a
+		// called reusable workflow too - but only logs the trust rules accepted may name parents.
+		if seen.jobParsed && seen.logsTrusted {
+			used, attributed = seen.facts.Uses(), true
 		}
+	} else if used, attributed, err = c.parseWorkflowUses(workingDir); err != nil {
+		return err
 	}
 	var localUses []githubactions.LocalUse
 	if attributed {

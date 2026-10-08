@@ -87,42 +87,15 @@ func lockAllBut(t *testing.T, root string, unlocked ...string) {
 var cachedCheckout = WorkerAction{Owner: "actions", Repo: "checkout", SHA: shaV4, Source: SourceCache}
 
 // TestCacheEntryReadOnlyOnDisk runs the real per-path check. Every path a test can create is owned by
-// the user running it, who can always chmod it back, so on disk only "not trusted" can be shown.
+// the user running it, who can always chmod it back, so on disk only "not trusted" can be shown: even a
+// cache the job's user made read-only is not trusted.
 func TestCacheEntryReadOnlyOnDisk(t *testing.T) {
 	skipOnWindowsOrAsRoot(t)
-	archive := "actions_checkout/" + shaV4 + ".tar.gz"
-	tests := []struct {
-		name     string
-		rootMode fs.FileMode
-		nodes    []cacheNode
-	}{
-		{
-			name:     "verify when the archive cache is writable then the entry is not trusted",
-			rootMode: 0o755,
-			nodes:    []cacheNode{{path: "actions_checkout", dir: true, mode: 0o755}, {path: archive, mode: 0o644}},
-		},
-		{
-			name:     "verify when the job's user owns a cache it made read-only then it can chmod it back and the entry is not trusted",
-			rootMode: 0o555,
-			nodes:    []cacheNode{{path: "actions_checkout", dir: true, mode: 0o555}, {path: archive, mode: 0o444}},
-		},
-		{
-			name:     "verify when a read-only archive sits in a writable folder then it can be replaced and is not trusted",
-			rootMode: 0o555,
-			nodes:    []cacheNode{{path: "actions_checkout", dir: true, mode: 0o755}, {path: archive, mode: 0o444}},
-		},
-		{
-			name:     "verify when the cache holds no entry for the action then it is not trusted",
-			rootMode: 0o555,
-			nodes:    []cacheNode{{path: "actions_checkout", dir: true, mode: 0o555}, {path: "actions_checkout/" + shaV3 + ".tar.gz", mode: 0o444}},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			root := archiveCache(t, tt.rootMode, tt.nodes...)
-			assert.False(t, CacheEntryReadOnly(root, cachedCheckout), "CacheEntryReadOnly(%q, %v)", root, cachedCheckout)
-		})
-	}
+	root := archiveCache(t, 0o555,
+		cacheNode{path: "actions_checkout", dir: true, mode: 0o555},
+		cacheNode{path: "actions_checkout/" + shaV4 + ".tar.gz", mode: 0o444})
+
+	assert.False(t, CacheEntryReadOnly(root, cachedCheckout), "CacheEntryReadOnly(%q, %v) of a cache the job's user owns", root, cachedCheckout)
 }
 
 // TestCacheEntryReadOnlyChecksEveryPath stands in for the per-path check, so that the paths it is

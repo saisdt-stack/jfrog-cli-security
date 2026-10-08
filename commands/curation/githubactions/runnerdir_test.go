@@ -76,37 +76,45 @@ func TestFindRunnerDirOnHostedLayouts(t *testing.T) {
 }
 
 func TestFindRunnerDirNotVisible(t *testing.T) {
-	accept := func(string) bool { return true }
-	t.Run("verify when the chain reaches pid 1 without a Worker then the runner is not visible", func(t *testing.T) {
-		// A container job: the action's node is started by the container's init, not by the Worker.
-		chain := fakeProcesses{
-			100: {ParentPID: 90, Exe: "/usr/local/bin/jf"},
-			90:  {ParentPID: 1, Exe: "/__e/node20/bin/node"},
-		}
-		_, err := findRunnerDir(100, chain.inspect, accept)
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
-	t.Run("verify when a process of the chain cannot be read then the runner is not visible", func(t *testing.T) {
-		_, err := findRunnerDir(100, fakeProcesses{100: {ParentPID: 90, Exe: "/opt/jf"}}.inspect, accept)
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
-	t.Run("verify when the chain loops then the walk gives up", func(t *testing.T) {
-		chain := fakeProcesses{
-			100: {ParentPID: 90, Exe: "/opt/jf"},
-			90:  {ParentPID: 100, Exe: "/opt/node"},
-		}
-		_, err := findRunnerDir(100, chain.inspect, accept)
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
-	t.Run("verify when the Worker's folder is not a runner directory then the runner is not visible", func(t *testing.T) {
-		_, err := findRunnerDir(100, preChain("/home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker").inspect,
-			func(string) bool { return false })
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
-	t.Run("verify when the Worker binary is not in a bin folder then the runner is not visible", func(t *testing.T) {
-		_, err := findRunnerDir(100, preChain("/home/runner/Runner.Worker").inspect, accept)
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
+	tests := []struct {
+		name  string
+		chain fakeProcesses // the process table the walk reads, from pid 100 up
+		// isRunnerDir is what the directory check answers; true in every row whose refusal is not about it.
+		isRunnerDir bool
+	}{
+		{
+			// A container job: the action's node is started by the container's init, not by the Worker.
+			name:        "verify when the chain reaches pid 1 without a Worker then the runner is not visible",
+			chain:       fakeProcesses{100: {ParentPID: 90, Exe: "/usr/local/bin/jf"}, 90: {ParentPID: 1, Exe: "/__e/node20/bin/node"}},
+			isRunnerDir: true,
+		},
+		{
+			name:        "verify when a process of the chain cannot be read then the runner is not visible",
+			chain:       fakeProcesses{100: {ParentPID: 90, Exe: "/opt/jf"}},
+			isRunnerDir: true,
+		},
+		{
+			name:        "verify when the chain loops then the walk gives up",
+			chain:       fakeProcesses{100: {ParentPID: 90, Exe: "/opt/jf"}, 90: {ParentPID: 100, Exe: "/opt/node"}},
+			isRunnerDir: true,
+		},
+		{
+			name:        "verify when the Worker's folder is not a runner directory then the runner is not visible",
+			chain:       preChain("/home/runner/actions-runner/cached/2.337.0/bin/Runner.Worker"),
+			isRunnerDir: false,
+		},
+		{
+			name:        "verify when the Worker binary is not in a bin folder then the runner is not visible",
+			chain:       preChain("/home/runner/Runner.Worker"),
+			isRunnerDir: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := findRunnerDir(100, tt.chain.inspect, func(string) bool { return tt.isRunnerDir })
+			assert.ErrorIs(t, err, ErrRunnerNotVisible, "findRunnerDir() = %q", got)
+		})
+	}
 }
 
 // workerLayout creates a runner directory with the Worker binary and, when withDiag is set, _diag.
@@ -123,17 +131,27 @@ func workerLayout(t *testing.T, withDiag bool) (runnerDir, workerExe string) {
 }
 
 func TestFindRunnerDirChecksTheDirectory(t *testing.T) {
-	t.Run("verify when the runner dir holds the Worker binary and _diag then it is returned", func(t *testing.T) {
-		runnerDir, workerExe := workerLayout(t, true)
-		got, err := findRunnerDir(100, preChain(workerExe).inspect, isRunnerDir)
-		require.NoError(t, err)
-		assert.Equal(t, runnerDir, got)
-	})
-	t.Run("verify when the runner dir has no _diag then it is refused", func(t *testing.T) {
-		_, workerExe := workerLayout(t, false)
-		_, err := findRunnerDir(100, preChain(workerExe).inspect, isRunnerDir)
-		assert.ErrorIs(t, err, ErrRunnerNotVisible)
-	})
+	tests := []struct {
+		name     string
+		withDiag bool // whether the runner directory holds _diag beside bin/Runner.Worker
+	}{
+		{name: "verify when the runner dir holds the Worker binary and _diag then it is returned", withDiag: true},
+		{name: "verify when the runner dir has no _diag then it is refused", withDiag: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerDir, workerExe := workerLayout(t, tt.withDiag)
+
+			got, err := findRunnerDir(100, preChain(workerExe).inspect, isRunnerDir)
+
+			if !tt.withDiag {
+				assert.ErrorIs(t, err, ErrRunnerNotVisible, "findRunnerDir() = %q", got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, runnerDir, got)
+		})
+	}
 }
 
 func TestInspectorReadsThisProcess(t *testing.T) {

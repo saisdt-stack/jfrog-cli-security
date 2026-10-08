@@ -34,6 +34,12 @@ const (
 
 	headerArtifactoryFilename = "X-Artifactory-Filename"
 	headerContentDisposition  = "Content-Disposition"
+	// headerCurationSource is forwarded by Artifactory to curation, which records it in its audit:
+	// a download API passes curation only the resolved commit, not the ref the workflow wrote.
+	headerCurationSource = "X-Artifactory-Curation-Source"
+	// curationSourceGitHubActions opens the source header's value, naming this command as the
+	// caller, as jf curation-audit's "jf-curation-audit" names that one.
+	curationSourceGitHubActions = "jf-curation-gh-actions"
 )
 
 // vcsHTTPRequestTimeout bounds each request end to end, body included, so a stalled Artifactory
@@ -149,7 +155,7 @@ func (c *vcsClient) cachedRefs(key string) (*RefAdvertisement, bool) {
 
 func (c *vcsClient) fetchRefs(repoKey, owner, repo string) (*RefAdvertisement, error) {
 	endpoint := c.repoEndpoint("refs", repoKey, owner, repo)
-	body, resp, err := c.get(endpoint)
+	body, resp, err := c.get(endpoint, "")
 	if err != nil {
 		return nil, err
 	}
@@ -177,8 +183,11 @@ func (c *vcsClient) fetchRefs(repoKey, owner, repo string) (*RefAdvertisement, e
 // and the archive filename Artifactory reports - where the resolved SHA is read from, see
 // ExtractResolvedSHA. The filename is "" when the response names none.
 //
+// workflowRef is the ref as the workflow wrote it, reported to curation in the source header; ""
+// when no workflow ref is known.
+//
 // A curation block is returned as a *BlockedError.
-func (c *vcsClient) Download(repoKey, owner, repo string, ref ResolvedRef) (io.ReadCloser, string, error) {
+func (c *vcsClient) Download(repoKey, owner, repo, workflowRef string, ref ResolvedRef) (io.ReadCloser, string, error) {
 	api, err := downloadAPI(ref.Kind)
 	if err != nil {
 		return nil, "", err
@@ -186,7 +195,7 @@ func (c *vcsClient) Download(repoKey, owner, repo string, ref ResolvedRef) (io.R
 	// ext is explicit: GitHub Enterprise remotes default to zip, and the comparison with the runner's
 	// copy reads tar.gz.
 	endpoint := c.repoEndpoint(api, repoKey, owner, repo) + "/" + escapeRefPath(ref.APIRef) + "?ext=" + vcsArchiveExtension
-	body, resp, err := c.get(endpoint)
+	body, resp, err := c.get(endpoint, curationSource(ref, workflowRef))
 	if err != nil {
 		return nil, "", err
 	}
@@ -205,11 +214,12 @@ func (c *vcsClient) Download(repoKey, owner, repo string, ref ResolvedRef) (io.R
 	return nil, "", errUnexpectedStatus(endpoint, resp, body)
 }
 
-// get sends a GET and returns the response body left open for streaming, whatever the status. A
-// transport error, a 5xx or a 429 is retried vcsHTTPRetries times after a jittered wait.
-func (c *vcsClient) get(endpoint string) (io.ReadCloser, *http.Response, error) {
+// get sends a GET, with the source header when source is not "", and returns the response body left
+// open for streaming, whatever the status. A transport error, a 5xx or a 429 is retried
+// vcsHTTPRetries times after a jittered wait.
+func (c *vcsClient) get(endpoint, source string) (io.ReadCloser, *http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		body, resp, err := c.getOnce(endpoint)
+		body, resp, err := c.getOnce(endpoint, source)
 		if attempt == vcsHTTPRetries || !retryable(resp, err) {
 			return body, resp, err
 		}
@@ -231,10 +241,13 @@ func retryable(resp *http.Response, err error) bool {
 	return resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests
 }
 
-func (c *vcsClient) getOnce(endpoint string) (io.ReadCloser, *http.Response, error) {
+func (c *vcsClient) getOnce(endpoint, source string) (io.ReadCloser, *http.Response, error) {
 	// Cloned per request: pre-request interceptors may rewrite the headers, and the client is
 	// shared across goroutines.
 	details := c.details.Clone()
+	if source != "" {
+		details.AddHeader(headerCurationSource, source)
+	}
 	body, resp, err := c.client.ReadRemoteFile(endpoint, details)
 	if err != nil {
 		return nil, nil, fmt.Errorf("sending GET %s: %w", endpoint, err)
@@ -275,6 +288,22 @@ func downloadAPI(kind RefKind) (string, error) {
 		return "downloadCommit", nil
 	}
 	return "", fmt.Errorf("no download API for ref kind %s", kind)
+}
+
+// curationSource is the source header's value for downloading ref:
+// "jf-curation-gh-actions;kind=<WorkflowRefKind>;ref=<workflow ref>", with ";ref=" left out when
+// workflowRef is "". The ref goes last and unescaped: a git ref may hold ';' and '=', so the reader
+// takes everything after "ref=".
+func curationSource(ref ResolvedRef, workflowRef string) string {
+	kind := ref.WorkflowKind
+	if kind == "" {
+		kind = WorkflowRefUnchecked
+	}
+	source := curationSourceGitHubActions + ";kind=" + string(kind)
+	if workflowRef != "" {
+		source += ";ref=" + workflowRef
+	}
+	return source
 }
 
 // archiveFilename reads the archive's name from X-Artifactory-Filename, falling back to

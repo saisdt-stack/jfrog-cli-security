@@ -314,7 +314,8 @@ func CrossReference(discovered []ActionRef, used JobUses) ([]ActionRef, []LocalU
 					case !hasParent[childKey]:
 						discovered[childIdx].Parent = parentIdentity
 						hasParent[childKey] = true
-					case direct[childKey] && discovered[childIdx].Parent == "" && !pulledInBy(discovered, byKey, parentIdx, childKey):
+					// A subpath of the entry being read is that entry again, not another action pulling it in.
+					case direct[childKey] && childKey != p.key && discovered[childIdx].Parent == "" && !pulledInBy(discovered, byKey, parentIdx, childKey):
 						discovered[childIdx].Parent = directAlsoViaPrefix + parentIdentity
 					}
 					isNew := markLocation(childKey, cu.Subpath)
@@ -344,10 +345,15 @@ func pulledInBy(discovered []ActionRef, byKey map[string]int, idx int, key strin
 		if parent == "" || strings.HasPrefix(parent, directAlsoViaPrefix) {
 			return false
 		}
-		if parent == key {
+		// Parent keeps the folder's spelling; keys fold the owner and repository's case.
+		parentKey := parent
+		if at := strings.LastIndex(parent, "@"); at >= 0 {
+			parentKey = strings.ToLower(parent[:at]) + parent[at:]
+		}
+		if parentKey == key {
 			return true
 		}
-		next, ok := byKey[parent]
+		next, ok := byKey[parentKey]
 		if !ok {
 			return false
 		}
@@ -357,5 +363,6 @@ func pulledInBy(discovered []ActionRef, byKey map[string]int, idx int, key strin
 }
 
 func refKey(owner, repo, ref string) string {
-	return owner + "/" + repo + "@" + ref
+	// GitHub owner and repository names are case-insensitive; a git ref is not.
+	return repoKey(owner, repo) + "@" + ref
 }

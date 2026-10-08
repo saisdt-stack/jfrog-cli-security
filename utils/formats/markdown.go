@@ -60,7 +60,7 @@ func RenderActionsException(actions []CuratedActions) string {
 		// The declarer matters most for a path a third-party composite action names: it points
 		// into this repository, so without it a reader has nowhere to start looking.
 		if use.DeclaredBy != "" {
-			described = append(described, fmt.Sprintf("%q declared by %s", use.Path, use.DeclaredBy))
+			described = append(described, fmt.Sprintf("%q declared by %q", use.Path, use.DeclaredBy))
 			continue
 		}
 		described = append(described, fmt.Sprintf("%q", use.Path))

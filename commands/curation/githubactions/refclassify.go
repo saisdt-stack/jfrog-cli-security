@@ -27,12 +27,32 @@ func (k RefKind) String() string {
 	return fmt.Sprintf("RefKind(%d)", int(k))
 }
 
+// WorkflowRefKind is what the ref a workflow wrote names, as the source header reports it to curation.
+// It describes the workflow's ref, never the download API used for it.
+type WorkflowRefKind string
+
+const (
+	WorkflowRefTag    WorkflowRefKind = "tag"
+	WorkflowRefBranch WorkflowRefKind = "branch"
+	// WorkflowRefCommit is a ref that is itself a full object ID.
+	WorkflowRefCommit WorkflowRefKind = "commit"
+	// WorkflowRefOther is a fully-qualified ref outside refs/tags and refs/heads, such as refs/pull/<n>/head.
+	WorkflowRefOther WorkflowRefKind = "other"
+	// WorkflowRefUnchecked is a ref that was not looked up: the action is decided by a commit the runner's
+	// logs name, so whether the ref is a tag or a branch is never asked.
+	WorkflowRefUnchecked WorkflowRefKind = "unchecked"
+)
+
 // ResolvedRef is a ref classified for download: which API to call, and what to put in its path.
 type ResolvedRef struct {
 	Kind RefKind
 	// APIRef is the download API's path argument: a short tag or branch name, never carrying a
 	// refs/ prefix, or a lowercase object ID.
 	APIRef string
+	// WorkflowKind is what the workflow's ref names, reported to curation in the source header (see
+	// curationSource). It differs from Kind when a named ref is downloaded by commit. The zero value is
+	// reported as WorkflowRefUnchecked.
+	WorkflowKind WorkflowRefKind
 }
 
 // NeedsRefs reports whether ClassifyRef needs the repository's ref advertisement for ref. Only a
@@ -57,7 +77,7 @@ func ClassifyRef(ref string, refAdv *RefAdvertisement) (ResolvedRef, error) {
 	if isFullObjectID(ref) {
 		// Hex is case-insensitive, so lower-casing is normalization, not a change of identity. The
 		// ID is not peeled: Artifactory's downloadCommit peels an annotated tag object itself.
-		return ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref)}, nil
+		return ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref), WorkflowKind: WorkflowRefCommit}, nil
 	}
 	if refAdv == nil {
 		return ResolvedRef{}, fmt.Errorf("classifying ref %q needs the repository's git refs", ref)
@@ -66,7 +86,7 @@ func ClassifyRef(ref string, refAdv *RefAdvertisement) (ResolvedRef, error) {
 		if _, found := refAdv.Refs[ref]; !found {
 			return ResolvedRef{}, errRefNotAdvertised(ref)
 		}
-		return ResolvedRef{Kind: RefKindTag, APIRef: name}, nil
+		return ResolvedRef{Kind: RefKindTag, APIRef: name, WorkflowKind: WorkflowRefTag}, nil
 	}
 	if name, ok := strings.CutPrefix(ref, headsPrefix); ok {
 		tip, found := refAdv.Refs[ref]
@@ -76,10 +96,11 @@ func ClassifyRef(ref string, refAdv *RefAdvertisement) (ResolvedRef, error) {
 		if _, collides := refAdv.Refs[tagsPrefix+name]; collides {
 			// Artifactory fetches a branch from GitHub by its bare name, and GitHub cannot tell a
 			// bare name shared by a tag and a branch apart - it answers 300, which downloadBranch
-			// surfaces as a 404. Downloading the branch's tip commit sidesteps the ambiguity.
-			return ResolvedRef{Kind: RefKindCommit, APIRef: tip}, nil
+			// surfaces as a 404. Downloading the branch's tip commit sidesteps the ambiguity; curation
+			// is still told the workflow named a branch.
+			return ResolvedRef{Kind: RefKindCommit, APIRef: tip, WorkflowKind: WorkflowRefBranch}, nil
 		}
-		return ResolvedRef{Kind: RefKindBranch, APIRef: name}, nil
+		return ResolvedRef{Kind: RefKindBranch, APIRef: name, WorkflowKind: WorkflowRefBranch}, nil
 	}
 	if strings.HasPrefix(ref, refsPrefix) {
 		// refs/pull/<n>/head and /merge, or any other namespace: there is no download API by
@@ -88,13 +109,13 @@ func ClassifyRef(ref string, refAdv *RefAdvertisement) (ResolvedRef, error) {
 		if !found {
 			return ResolvedRef{}, errRefNotAdvertised(ref)
 		}
-		return ResolvedRef{Kind: RefKindCommit, APIRef: oid}, nil
+		return ResolvedRef{Kind: RefKindCommit, APIRef: oid, WorkflowKind: WorkflowRefOther}, nil
 	}
 	if _, isTag := refAdv.Refs[tagsPrefix+ref]; isTag {
-		return ResolvedRef{Kind: RefKindTag, APIRef: ref}, nil
+		return ResolvedRef{Kind: RefKindTag, APIRef: ref, WorkflowKind: WorkflowRefTag}, nil
 	}
 	if _, isBranch := refAdv.Refs[headsPrefix+ref]; isBranch {
-		return ResolvedRef{Kind: RefKindBranch, APIRef: ref}, nil
+		return ResolvedRef{Kind: RefKindBranch, APIRef: ref, WorkflowKind: WorkflowRefBranch}, nil
 	}
 	return ResolvedRef{}, errRefNotAdvertised(ref)
 }

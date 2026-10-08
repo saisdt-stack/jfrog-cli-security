@@ -69,14 +69,14 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 	owner, repo := strings.ToLower(ref.Owner), strings.ToLower(ref.Repo)
 	switch {
 	case ref.RunnerSHA != "" && ref.Verification == VerifyLoggedSHA:
-		result, err := d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.RunnerSHA)
+		result, err := d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.Ref, WorkflowRefUnchecked, ref.RunnerSHA)
 		if err == nil && ref.Unpaired() {
 			result.Notes += "; " + unpairedLoggedCommitNote
 		}
 		return result, err
 	case ref.RunnerSHA != "":
 		return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref,
-			ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref.RunnerSHA)})
+			ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(ref.RunnerSHA), WorkflowKind: WorkflowRefUnchecked})
 	}
 
 	var adv *RefAdvertisement
@@ -92,7 +92,7 @@ func (d *artifactoryActionCurationDecider) Decide(ctx context.Context, artifacto
 	}
 
 	if commit, ok := loggedCommitOf(ref, adv, resolved); ok {
-		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, commit)
+		return d.decideRunnerCommit(artifactoryVcsRepo, owner, repo, ref.Ref, resolved.WorkflowKind, commit)
 	}
 	return d.compareAtCommit(artifactoryVcsRepo, owner, repo, ref, resolved)
 }
@@ -120,7 +120,7 @@ func loggedCommitOf(ref ActionRef, adv *RefAdvertisement, resolved ResolvedRef) 
 // compareAtCommit downloads resolved and compares the archive with the runner's copy at ref.Path,
 // which is only ever read.
 func (d *artifactoryActionCurationDecider) compareAtCommit(artifactoryVcsRepo, owner, repo string, ref ActionRef, resolved ResolvedRef) (ActionCurationResult, error) {
-	body, filename, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
+	body, filename, err := d.client.Download(artifactoryVcsRepo, owner, repo, ref.Ref, resolved)
 	var blocked *BlockedError
 	if errors.As(err, &blocked) {
 		// A block serves no archive to read the commit from, so the commit is named only when the
@@ -180,11 +180,12 @@ func verifiedByContentNote(ref ActionRef) string {
 // not compared: the commit identifies the content, and the runner's action cache is the admin's,
 // trusted to hold what its SHA names.
 //
-// Because the request names the commit, curation audit records this action by its SHA,
-// not by the tag or branch the workflow wrote.
-func (d *artifactoryActionCurationDecider) decideRunnerCommit(artifactoryVcsRepo, owner, repo, sha string) (ActionCurationResult, error) {
-	resolved := ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(sha)}
-	body, _, err := d.client.Download(artifactoryVcsRepo, owner, repo, resolved)
+// The request names the commit, so curation learns workflowRef, the ref the workflow wrote, and
+// workflowKind, what it names, only from the source header. workflowRef is "" for an unpaired logged
+// commit.
+func (d *artifactoryActionCurationDecider) decideRunnerCommit(artifactoryVcsRepo, owner, repo, workflowRef string, workflowKind WorkflowRefKind, sha string) (ActionCurationResult, error) {
+	resolved := ResolvedRef{Kind: RefKindCommit, APIRef: strings.ToLower(sha), WorkflowKind: workflowKind}
+	body, _, err := d.client.Download(artifactoryVcsRepo, owner, repo, workflowRef, resolved)
 	var blocked *BlockedError
 	if errors.As(err, &blocked) {
 		return ActionCurationResult{Status: ActionRejected, Notes: blockedNotes(blocked.Reason, resolved.APIRef)}, nil

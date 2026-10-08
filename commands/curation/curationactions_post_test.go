@@ -52,110 +52,114 @@ func preJob(t *testing.T, worker string) (runnerDir, cacheDir string) {
 	}, []string{"jfrog/curate/v1", "actions/checkout/v4"})
 }
 
-func TestCurationActionsCommand_Run_FromPreSavesWhatItDecided(t *testing.T) {
-	t.Run("verify when the pre decides then every decided commit is saved for the post", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-		t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
-		t.Setenv(stepSummaryEnvVar, "")
-		statePath := filepath.Join(t.TempDir(), "save_state")
-		require.NoError(t, os.WriteFile(statePath, []byte("other=kept\n"), 0o644))
-		t.Setenv(githubStateEnvVar, statePath)
-		runnerDir, cacheDir := preJob(t, savedLine("jfrog", "curate", testShaSelf)+savedLine("Actions", "Checkout", testShaV4))
-		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{}).SetFromPre(true)
-		cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
-
-		_, err := captureReport(t, cmd)
-
-		require.NoError(t, err)
-		state := readSavedState(t, statePath)
-		assert.Equal(t, "kept", state["other"], "what other steps saved must be kept")
-		assert.ElementsMatch(t, []string{"actions/checkout@" + testShaV4, "jfrog/curate@" + testShaSelf},
-			strings.Fields(state[decidedStateName]))
-		assert.Equal(t, "true", state[logsTrustedStateName], "the pre was the first step of a hosted job, so its logs are trusted")
-	})
-	t.Run("verify when the pre cannot find the runner then it saves that its logs were not trusted", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-		t.Setenv(stepSummaryEnvVar, "")
-		statePath := filepath.Join(t.TempDir(), "save_state")
-		t.Setenv(githubStateEnvVar, statePath)
-		_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
-		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{}).SetFromPre(true)
-		cmd.runnerDirFinder = nil
-
-		_, err := captureReport(t, cmd)
-
-		require.NoError(t, err)
-		assert.Equal(t, "false", readSavedState(t, statePath)[logsTrustedStateName])
-	})
-	t.Run("verify when the decided set is too large then nothing is saved", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		t.Setenv(stepSummaryEnvVar, "")
-		statePath := filepath.Join(t.TempDir(), "save_state")
-		t.Setenv(githubStateEnvVar, statePath)
-		var refs []githubactions.ActionRef
-		for i := range 2000 {
-			refs = append(refs, githubactions.ActionRef{Owner: "owner-with-a-long-name", Repo: fmt.Sprintf("repository-%04d", i),
-				RunnerSHA: testShaV4, Verification: githubactions.VerifyLoggedSHA})
-		}
-		cmd := NewCurationActionsCommand().SetActionsCacheDir(t.TempDir()).SetDecider(&scriptedDecider{}).
-			SetActionDiscoverer(fixedDiscoverer{refs: refs}).SetFromPre(true)
-		cmd.runnerDirFinder = nil
-
-		report, err := captureReport(t, cmd)
-
-		require.NoError(t, err)
-		state := readSavedState(t, statePath)
-		assert.NotContains(t, state, decidedStateName)
-		assert.Equal(t, "false", state[logsTrustedStateName])
-		assert.Contains(t, report, "post will decide every")
-	})
+// manyLoggedRefs is n actions logged by SHA, enough of them that their keys overflow what a step can save.
+func manyLoggedRefs(n int) []githubactions.ActionRef {
+	var refs []githubactions.ActionRef
+	for i := range n {
+		refs = append(refs, githubactions.ActionRef{Owner: "owner-with-a-long-name", Repo: fmt.Sprintf("repository-%04d", i),
+			RunnerSHA: testShaV4, Verification: githubactions.VerifyLoggedSHA})
+	}
+	return refs
 }
 
+func TestCurationActionsCommand_Run_FromPreSavesWhatItDecided(t *testing.T) {
+	tests := []struct {
+		name string
+		// trustedRunner: the pre finds preJob's hosted runner, whose Worker log names both actions by SHA,
+		// checkout in mixed case; false: no runner is visible, so the cache (actions/checkout/v4) is walked.
+		trustedRunner bool
+		// discovered, when > 0, hands Run that many refs through a fixedDiscoverer instead.
+		discovered  int
+		wantDecided []string // the keys saved for the post; nil: the decided set is not saved
+		wantTrusted string   // the saved JFROG_CURATION_LOGS_TRUSTED
+	}{
+		{name: "verify when the pre decides then every decided commit is saved for the post", trustedRunner: true,
+			wantDecided: []string{"actions/checkout@" + testShaV4, "jfrog/curate@" + testShaSelf}, wantTrusted: "true"},
+		{name: "verify when the pre cannot find the runner then it saves each action by ref and that its logs were not trusted",
+			wantDecided: []string{"actions/checkout@v4"}, wantTrusted: "false"},
+		{name: "verify when the decided set is too large then nothing is saved", discovered: 2000, wantTrusted: "false"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, "", "")
+			t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+			t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+			t.Setenv(stepSummaryEnvVar, "")
+			statePath := filepath.Join(t.TempDir(), "save_state")
+			require.NoError(t, os.WriteFile(statePath, []byte("other=kept\n"), 0o644))
+			t.Setenv(githubStateEnvVar, statePath)
+			var runnerDir, cacheDir string
+			if tt.trustedRunner {
+				runnerDir, cacheDir = preJob(t, savedLine("jfrog", "curate", testShaSelf)+savedLine("Actions", "Checkout", testShaV4))
+			} else {
+				_, cacheDir = runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
+			}
+			cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{}).SetFromPre(true)
+			if tt.discovered > 0 {
+				cmd.SetActionDiscoverer(fixedDiscoverer{refs: manyLoggedRefs(tt.discovered)})
+			}
+			cmd.runnerDirFinder = nil
+			if tt.trustedRunner {
+				cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+			}
+
+			report, err := captureReport(t, cmd)
+
+			require.NoError(t, err)
+			state := readSavedState(t, statePath)
+			assert.Equal(t, "kept", state["other"], "what other steps saved must be kept")
+			assert.Equal(t, tt.wantTrusted, state[logsTrustedStateName])
+			decided, saved := state[decidedStateName]
+			assert.Equal(t, tt.wantDecided != nil, saved, "state: %v", state)
+			assert.ElementsMatch(t, tt.wantDecided, strings.Fields(decided))
+			assert.Equal(t, tt.wantDecided == nil, strings.Contains(report, "post will decide every"), "report: %s", report)
+		})
+	}
+}
+
+// testShaLate is the commit of an action the runner fetched after the pre step.
+const testShaLate = "1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e"
+
 func TestCurationActionsCommand_Run_FromPostReportsActionsFetchedAfterThePre(t *testing.T) {
-	const testShaLate = "1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e1a7e"
 	worker := savedLine("jfrog", "curate", testShaSelf) + savedLine("actions", "checkout", testShaV4) +
 		savedLine("evil", "late", testShaLate)
 	tests := []struct {
-		name string
-		// saved is STATE_JFROG_CURATION_DECIDED; nil leaves it unset.
-		saved        *string
-		rejected     []string
-		wantAsked    []string
-		wantErr      bool
-		wantWarning  string
-		wantInReport string
-		// notInReport must not appear: an action the pre did not decide by SHA is not known to be fetched late.
-		notInReport string
+		name      string
+		saved     *string  // STATE_JFROG_CURATION_DECIDED; nil leaves it unset
+		rejected  []string // keys the scriptedDecider rejects
+		wantAsked []string
+		wantErr   bool
+		// wantNotSavedWarning: the post warns that the pre's decisions were not saved.
+		wantNotSavedWarning bool
+		// wantNote is the note every row the post decided carries: fetchedLateNote when the pre saved SHAs,
+		// notBySHANote when it saved none, so whether a commit came late is unknown.
+		wantNote string
 	}{
 		{
-			name:         "verify when the Worker log gained a rejected action since the pre then it is reported and fails the post",
-			saved:        new("jfrog/curate@" + testShaSelf + "\nactions/checkout@" + testShaV4),
-			rejected:     []string{"evil/late@" + testShaLate},
-			wantAsked:    []string{"evil/late@" + testShaLate},
-			wantErr:      true,
-			wantInReport: "| evil/late | " + testShaLate + " | Rejected | rejected in test; fetched after the job started |",
+			name:      "verify when the Worker log gained a rejected action since the pre then it is reported and fails the post",
+			saved:     new("jfrog/curate@" + testShaSelf + "\nactions/checkout@" + testShaV4),
+			rejected:  []string{"evil/late@" + testShaLate},
+			wantAsked: []string{"evil/late@" + testShaLate},
+			wantErr:   true,
+			wantNote:  fetchedLateNote,
 		},
 		{
-			name:         "verify when the action fetched since the pre is approved then the post passes",
-			saved:        new("jfrog/curate@" + testShaSelf + "\r\nActions/Checkout@" + strings.ToUpper(testShaV4)),
-			wantAsked:    []string{"evil/late@" + testShaLate},
-			wantInReport: "fetched after the job started",
+			name:      "verify when the action fetched since the pre is approved then the post passes",
+			saved:     new("jfrog/curate@" + testShaSelf + "\r\nActions/Checkout@" + strings.ToUpper(testShaV4)),
+			wantAsked: []string{"evil/late@" + testShaLate},
+			wantNote:  fetchedLateNote,
 		},
 		{
-			name:         "verify when the pre saved nothing then every logged commit is decided",
-			wantAsked:    []string{"jfrog/curate@" + testShaSelf, "actions/checkout@" + testShaV4, "evil/late@" + testShaLate},
-			wantWarning:  "decided by the pre were not saved",
-			wantInReport: "| evil/late | " + testShaLate + " | Approved | not decided by SHA in pre |",
-			notInReport:  fetchedLateNote,
+			name:                "verify when the pre saved nothing then every logged commit is decided",
+			wantAsked:           []string{"jfrog/curate@" + testShaSelf, "actions/checkout@" + testShaV4, "evil/late@" + testShaLate},
+			wantNotSavedWarning: true,
+			wantNote:            notBySHANote,
 		},
 		{
-			name:         "verify when the pre saved no SHA then no commit is labelled as fetched late",
-			saved:        new("actions/checkout@v4"),
-			wantAsked:    []string{"jfrog/curate@" + testShaSelf, "actions/checkout@" + testShaV4, "evil/late@" + testShaLate},
-			wantInReport: "| actions/checkout | " + testShaV4 + " | Approved | not decided by SHA in pre |",
-			notInReport:  fetchedLateNote,
+			name:      "verify when the pre saved no SHA then no commit is labelled as fetched late",
+			saved:     new("actions/checkout@v4"),
+			wantAsked: []string{"jfrog/curate@" + testShaSelf, "actions/checkout@" + testShaV4, "evil/late@" + testShaLate},
+			wantNote:  notBySHANote,
 		},
 	}
 	for _, tt := range tests {
@@ -178,11 +182,13 @@ func TestCurationActionsCommand_Run_FromPostReportsActionsFetchedAfterThePre(t *
 
 			assert.Equal(t, tt.wantErr, err != nil, "Run() error = %v", err)
 			assert.ElementsMatch(t, tt.wantAsked, decider.asked)
-			assert.Contains(t, report, tt.wantInReport)
-			assert.Contains(t, report, tt.wantWarning)
-			if tt.notInReport != "" {
-				assert.NotContains(t, report, tt.notInReport)
+			assert.Equal(t, len(tt.wantAsked), strings.Count(report, tt.wantNote+" |"), "every post row carries %q:\n%s", tt.wantNote, report)
+			otherNote := notBySHANote
+			if tt.wantNote == notBySHANote {
+				otherNote = fetchedLateNote
 			}
+			assert.NotContains(t, report, otherNote)
+			assert.Equal(t, tt.wantNotSavedWarning, strings.Contains(report, "decided by the pre were not saved"), "report: %s", report)
 			content, readErr := os.ReadFile(summary)
 			require.NoError(t, readErr)
 			assert.Contains(t, string(content), "| evil/late |")
@@ -190,46 +196,48 @@ func TestCurationActionsCommand_Run_FromPostReportsActionsFetchedAfterThePre(t *
 				"the post cannot undo what ran, so it removes nothing")
 		})
 	}
-	t.Run("verify when the runner cannot be found then the post has nothing to check and passes", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		t.Setenv(stepSummaryEnvVar, "")
-		decider := &scriptedDecider{}
-		cmd := NewCurationActionsCommand().SetDecider(decider).SetFromPost(true)
-		cmd.runnerDirFinder = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
+}
 
-		report, err := captureReport(t, cmd)
+func TestCurationActionsCommand_Run_FromPostWithAnInvisibleRunnerHasNothingToCheck(t *testing.T) {
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(stepSummaryEnvVar, "")
+	decider := &scriptedDecider{}
+	cmd := NewCurationActionsCommand().SetDecider(decider).SetFromPost(true)
+	cmd.runnerDirFinder = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
 
-		require.NoError(t, err)
-		assert.Empty(t, decider.asked)
-		assert.Contains(t, report, "[Warn]")
-	})
-	t.Run("verify when the pre's state round-trips then nothing it decided is decided again", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-		t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
-		t.Setenv(stepSummaryEnvVar, "")
-		statePath := filepath.Join(t.TempDir(), "save_state")
-		t.Setenv(githubStateEnvVar, statePath)
-		runnerDir, cacheDir := preJob(t, savedLine("jfrog", "curate", testShaSelf)+savedLine("actions", "checkout", testShaV4))
-		pre := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{}).SetFromPre(true)
-		pre.runnerDirFinder = func() (string, error) { return runnerDir, nil }
-		_, err := captureReport(t, pre)
-		require.NoError(t, err)
-		worker := filepath.Join(runnerDir, "_diag", "Worker_20261005-050652-utc.log")
-		f, err := os.OpenFile(worker, os.O_APPEND|os.O_WRONLY, 0)
-		require.NoError(t, err)
-		_, err = f.WriteString(savedLine("evil", "late", testShaLate))
-		require.NoError(t, errors.Join(err, f.Close()))
-		t.Setenv(postStateEnvVar, readSavedState(t, statePath)[decidedStateName])
-		decider := &scriptedDecider{}
-		post := NewCurationActionsCommand().SetDecider(decider).SetFromPost(true)
-		post.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+	report, err := captureReport(t, cmd)
 
-		_, err = captureReport(t, post)
+	require.NoError(t, err)
+	assert.Empty(t, decider.asked)
+	assert.Contains(t, report, "[Warn]")
+}
 
-		require.NoError(t, err)
-		assert.Equal(t, []string{"evil/late@" + testShaLate}, slices.Clone(decider.asked))
-	})
+func TestCurationActionsCommand_Run_FromPostDecidesOnlyWhatThePreSaved(t *testing.T) {
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+	t.Setenv(stepSummaryEnvVar, "")
+	statePath := filepath.Join(t.TempDir(), "save_state")
+	t.Setenv(githubStateEnvVar, statePath)
+	runnerDir, cacheDir := preJob(t, savedLine("jfrog", "curate", testShaSelf)+savedLine("actions", "checkout", testShaV4))
+	pre := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{}).SetFromPre(true)
+	pre.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+	_, err := captureReport(t, pre)
+	require.NoError(t, err)
+	worker := filepath.Join(runnerDir, "_diag", "Worker_20261005-050652-utc.log")
+	f, err := os.OpenFile(worker, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteString(savedLine("evil", "late", testShaLate))
+	require.NoError(t, errors.Join(err, f.Close()))
+	t.Setenv(postStateEnvVar, readSavedState(t, statePath)[decidedStateName])
+	decider := &scriptedDecider{}
+	post := NewCurationActionsCommand().SetDecider(decider).SetFromPost(true)
+	post.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+
+	_, err = captureReport(t, post)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"evil/late@" + testShaLate}, slices.Clone(decider.asked))
 }
 
 func TestCurationActionsCommand_Run_FromPostRowsAreNotLabelledUnpaired(t *testing.T) {

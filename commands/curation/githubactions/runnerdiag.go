@@ -219,6 +219,37 @@ func (j JobFacts) FirstStepContinuesOnError(self string) (continues, found bool)
 	return j.Steps[0].ContinueOnError, true
 }
 
+// Uses is the job's own uses: steps as the job message names them, in step order. The message is the
+// job as the runner runs it, so inside a called reusable workflow these are that workflow's steps, not
+// its caller's. docker:// and run: steps are not uses, as in a workflow file, and a local action named
+// twice is one local use.
+func (j JobFacts) Uses() JobUses {
+	var uses JobUses
+	seenLocal := map[string]bool{}
+	for _, s := range j.Steps {
+		if !strings.EqualFold(s.Type, "repository") {
+			continue
+		}
+		if strings.EqualFold(s.RepositoryType, "self") {
+			if s.Path != "" && !seenLocal[s.Path] {
+				seenLocal[s.Path] = true
+				uses.Local = append(uses.Local, LocalUse{Raw: s.Path})
+			}
+			continue
+		}
+		owner, repo, ok := strings.Cut(s.Name, "/")
+		if !strings.EqualFold(s.RepositoryType, "github") || !ok || owner == "" || repo == "" || s.Ref == "" {
+			continue
+		}
+		raw := s.Name
+		if s.Path != "" {
+			raw += "/" + s.Path
+		}
+		uses.Remote = append(uses.Remote, WorkflowUse{Owner: owner, Repo: repo, Subpath: s.Path, Ref: s.Ref, Raw: raw + "@" + s.Ref})
+	}
+	return uses
+}
+
 // jobMessage is the job message a Worker logs, decoded once. Fields stay raw so a malformed one costs
 // only its own facts, not the run identity. encoding/json matches the field names case-insensitively.
 type jobMessage struct {
