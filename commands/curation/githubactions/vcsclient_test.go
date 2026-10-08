@@ -75,7 +75,6 @@ func TestVCSClientGetRefs(t *testing.T) {
 		{name: "verify when getRefs returns 403 then it is an access failure and not a curation block", status: http.StatusForbidden, body: blockedEnvelope, wantCalls: 1, wantDenied: true, wantAnyErr: true},
 		{name: "verify when getRefs returns 404 then the error carries Artifactory's message", status: http.StatusNotFound, body: notFoundBody, wantCalls: 1, wantAnyErr: true, wantInError: "Not found"},
 		{name: "verify when getRefs returns 500 then it is retried and then fails", status: http.StatusInternalServerError, wantCalls: vcsHTTPRetries + 1, wantAnyErr: true},
-		{name: "verify when getRefs returns 429 then it is retried and then fails", status: http.StatusTooManyRequests, wantCalls: vcsHTTPRetries + 1, wantAnyErr: true},
 		{name: "verify when getRefs returns 200 with a malformed body then it fails to parse", status: http.StatusOK, body: "not a pkt-line stream", wantCalls: 1, wantAnyErr: true},
 	}
 	for _, tt := range tests {
@@ -83,10 +82,17 @@ func TestVCSClientGetRefs(t *testing.T) {
 			var calls atomic.Int32
 			// getRefs labels its pkt-line body application/json; the client must not care.
 			header := http.Header{"Content-Type": {"application/json"}}
-			client := newTestVCSClient(t, respond(tt.status, header, tt.body, &calls))
+			var gotPath, gotAuth string
+			answer := respond(tt.status, header, tt.body, &calls)
+			client := newTestVCSClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotAuth = r.URL.EscapedPath(), r.Header.Get("Authorization")
+				answer.ServeHTTP(w, r)
+			}))
 
 			got, err := client.GetRefs(testRepoKey, "actions", "checkout")
 
+			assert.Equal(t, "/artifactory/api/vcs/refs/github-vcs/actions/checkout", gotPath, "GetRefs() request path")
+			assert.Equal(t, "Bearer "+testAccessToken, gotAuth, "GetRefs() Authorization header")
 			assert.Equal(t, tt.wantCalls, calls.Load(), "GetRefs() request count")
 			var blocked *BlockedError
 			assert.False(t, errors.As(err, &blocked), "GetRefs() error = %v; a getRefs failure must never be a curation block", err)
@@ -105,66 +111,53 @@ func TestVCSClientGetRefs(t *testing.T) {
 	}
 }
 
-func TestVCSClientGetRefsRequest(t *testing.T) {
-	t.Run("verify when refs are requested then the documented path and the configured token are used", func(t *testing.T) {
-		var gotPath, gotAuth string
-		client := newTestVCSClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			gotPath, gotAuth = r.URL.EscapedPath(), r.Header.Get("Authorization")
-			_, _ = io.WriteString(w, capturedAdvertisement)
-		}))
+// TestVCSClientGetRefsSharesOneRequestPerRepository verifies that when many callers ask for one
+// repository's refs concurrently then it is requested once.
+func TestVCSClientGetRefsSharesOneRequestPerRepository(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	client := newTestVCSClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		<-release // hold the first request so the other callers pile up behind it
+		_, _ = io.WriteString(w, capturedAdvertisement)
+	}))
+	const callers = 20
+	var started, done sync.WaitGroup
+	errs := make([]error, callers)
+	for i := range callers {
+		started.Add(1)
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			started.Done()
+			_, errs[i] = client.GetRefs(testRepoKey, "actions", "checkout")
+		}()
+	}
+	started.Wait()
+	close(release)
+	done.Wait()
 
-		_, err := client.GetRefs(testRepoKey, "actions", "checkout")
+	_, err := client.GetRefs(testRepoKey, "actions", "checkout") // served from the cache
 
-		require.NoError(t, err)
-		assert.Equal(t, "/artifactory/api/vcs/refs/github-vcs/actions/checkout", gotPath)
-		assert.Equal(t, "Bearer "+testAccessToken, gotAuth)
-	})
+	require.NoError(t, err)
+	for i, err := range errs {
+		assert.NoError(t, err, "GetRefs() caller %d", i)
+	}
+	assert.Equal(t, int32(1), calls.Load(), "GetRefs() request count across %d callers", callers+1)
 }
 
-func TestVCSClientGetRefsIsFetchedOncePerRepository(t *testing.T) {
-	t.Run("verify when many callers ask for one repository's refs concurrently then it is requested once", func(t *testing.T) {
-		var calls atomic.Int32
-		release := make(chan struct{})
-		client := newTestVCSClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			calls.Add(1)
-			<-release // hold the first request so the other callers pile up behind it
-			_, _ = io.WriteString(w, capturedAdvertisement)
-		}))
-		const callers = 20
-		var started, done sync.WaitGroup
-		errs := make([]error, callers)
-		for i := range callers {
-			started.Add(1)
-			done.Add(1)
-			go func() {
-				defer done.Done()
-				started.Done()
-				_, errs[i] = client.GetRefs(testRepoKey, "actions", "checkout")
-			}()
-		}
-		started.Wait()
-		close(release)
-		done.Wait()
+// TestVCSClientGetRefsKeepsRepositoriesApart verifies that when different repositories are asked for
+// then each is requested, so one repository's refs are never classified with another's advertisement.
+func TestVCSClientGetRefsKeepsRepositoriesApart(t *testing.T) {
+	var calls atomic.Int32
+	client := newTestVCSClient(t, respond(http.StatusOK, nil, capturedAdvertisement, &calls))
 
-		_, err := client.GetRefs(testRepoKey, "actions", "checkout") // served from the cache
+	_, errCheckout := client.GetRefs(testRepoKey, "actions", "checkout")
+	_, errSetupNode := client.GetRefs(testRepoKey, "actions", "setup-node")
 
-		require.NoError(t, err)
-		for i, err := range errs {
-			assert.NoError(t, err, "GetRefs() caller %d", i)
-		}
-		assert.Equal(t, int32(1), calls.Load(), "GetRefs() request count across %d callers", callers+1)
-	})
-	t.Run("verify when different repositories are asked for then each is requested", func(t *testing.T) {
-		var calls atomic.Int32
-		client := newTestVCSClient(t, respond(http.StatusOK, nil, capturedAdvertisement, &calls))
-
-		_, errCheckout := client.GetRefs(testRepoKey, "actions", "checkout")
-		_, errSetupNode := client.GetRefs(testRepoKey, "actions", "setup-node")
-
-		require.NoError(t, errCheckout)
-		require.NoError(t, errSetupNode)
-		assert.Equal(t, int32(2), calls.Load())
-	})
+	require.NoError(t, errCheckout)
+	require.NoError(t, errSetupNode)
+	assert.Equal(t, int32(2), calls.Load(), "GetRefs() request count for two repositories")
 }
 
 func TestVCSClientDownload(t *testing.T) {

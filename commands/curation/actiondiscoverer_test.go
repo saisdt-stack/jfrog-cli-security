@@ -33,58 +33,78 @@ type fixedDiscoverer struct {
 func (f fixedDiscoverer) Discover() ([]githubactions.ActionRef, error) { return f.refs, f.err }
 
 func TestCacheWalkDiscoverer(t *testing.T) {
-	t.Run("verify when the cache holds actions then each is returned once", func(t *testing.T) {
-		_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4", "actions/setup-go/v5"}}.build(t)
-		refs, err := cacheWalkDiscoverer{actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		var got []string
-		for _, r := range refs {
-			got = append(got, r.Owner+"/"+r.Repo+"@"+r.Ref)
-		}
-		assert.ElementsMatch(t, []string{"actions/checkout@v4", "actions/setup-go@v5"}, got)
-	})
-	t.Run("verify when the cache is empty then it reports the cache as unreadable", func(t *testing.T) {
-		_, cacheDir := runnerSpec{}.build(t)
-		_, err := cacheWalkDiscoverer{actionsCacheDir: cacheDir}.Discover()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot read the GitHub Actions cache")
-	})
-	t.Run("verify when an entry cannot be accounted for then it fails", func(t *testing.T) {
-		_, cacheDir := runnerSpec{}.build(t)
-		require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, "actions", "checkout", "v4"), 0o755))
-		_, err := cacheWalkDiscoverer{actionsCacheDir: cacheDir}.Discover()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot account for every entry")
-	})
+	tests := []struct {
+		name      string
+		cacheDirs []string // owner/repo/ref entries written with their .completed watermark
+		bareDirs  []string // owner/repo/ref entries written without one, which discovery cannot account for
+		want      map[string]refFacts
+		wantErr   string // substring of Discover's error; "" when it succeeds
+	}{
+		{
+			name:      "verify when the cache holds actions then each is returned once",
+			cacheDirs: []string{"actions/checkout/v4", "actions/setup-go/v5"},
+			want:      map[string]refFacts{"actions/checkout@v4": {}, "actions/setup-go@v5": {}},
+		},
+		{
+			name:    "verify when the cache is empty then it reports the cache as unreadable",
+			wantErr: "cannot read the GitHub Actions cache",
+		},
+		{
+			name:     "verify when an entry cannot be accounted for then it fails",
+			bareDirs: []string{"actions/checkout/v4"},
+			wantErr:  "cannot account for every entry",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, cacheDir := runnerSpec{cacheDirs: tt.cacheDirs}.build(t)
+			for _, dir := range tt.bareDirs {
+				require.NoError(t, os.MkdirAll(filepath.Join(cacheDir, filepath.FromSlash(dir)), 0o755))
+			}
+			refs, err := cacheWalkDiscoverer{actionsCacheDir: cacheDir}.Discover()
+			if tt.wantErr != "" {
+				assert.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Len(t, refs, len(tt.want), "Discover() refs")
+			assert.Equal(t, tt.want, factsOf(refs))
+		})
+	}
 }
 
-func TestCurationActionsCommand_Run_UsesTheConfiguredDiscoverer(t *testing.T) {
-	pinRunnerEnv(t, "octo/repo", "", "")
-	_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
-	cmd := NewCurationActionsCommand().
-		SetActionsCacheDir(cacheDir).
-		SetDecider(&scriptedDecider{}).
-		SetActionDiscoverer(fixedDiscoverer{refs: []githubactions.ActionRef{
-			{Owner: "only", Repo: "this", Ref: "v9", Path: filepath.Join(cacheDir, "actions", "checkout", "v4")},
-		}})
-	report, err := captureReport(t, cmd)
-	require.NoError(t, err)
-	assert.Contains(t, report, "only/this")
-	assert.NotContains(t, report, "actions/checkout")
-}
-
-func TestCurationActionsCommand_Run_ReturnsTheDiscovererError(t *testing.T) {
-	pinRunnerEnv(t, "octo/repo", "", "")
-	want := errors.New("discovery failed")
-	cmd := NewCurationActionsCommand().
-		SetActionsCacheDir(t.TempDir()).
-		SetDecider(&scriptedDecider{}).
-		SetActionDiscoverer(fixedDiscoverer{err: want})
-	var buf bytes.Buffer
-	previous := log.Logger
-	log.SetLogger(log.NewLogger(log.INFO, &buf))
-	t.Cleanup(func() { log.SetLogger(previous) })
-	assert.ErrorIs(t, cmd.Run(), want)
+func TestCurationActionsCommand_Run_DiscoveryFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		discoverer actionDiscoverer         // nil: Run picks the discoverer for mode
+		mode       githubactions.CallerMode // the zero value runs as a step
+		wantErr    string                   // substring of Run's error
+	}{
+		{
+			name:       "verify when the discoverer fails then Run returns its error and decides nothing",
+			discoverer: fixedDiscoverer{err: errors.New("discovery failed")},
+			wantErr:    "discovery failed",
+		},
+		{
+			name:    "verify when run as the hook without a runner directory then it fails before deciding",
+			mode:    githubactions.ModeHook,
+			wantErr: "runner directory",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, "", "")
+			_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
+			decider := &scriptedDecider{}
+			cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(decider).SetCallerMode(tt.mode, "")
+			if tt.discoverer != nil {
+				cmd.SetActionDiscoverer(tt.discoverer)
+			}
+			_, err := captureReport(t, cmd)
+			assert.ErrorContains(t, err, tt.wantErr)
+			assert.Empty(t, decider.asked, "no action may be decided when discovery failed")
+		})
+	}
 }
 
 const (
@@ -129,211 +149,392 @@ func hookRunnerForJob(t *testing.T, job string, diag map[string]string, cacheDir
 	return runnerDir, cacheDir
 }
 
+// withDiag returns a copy of diag with name set to content.
+func withDiag(diag map[string]string, name, content string) map[string]string {
+	out := maps.Clone(diag)
+	out[name] = content
+	return out
+}
+
 func TestRunnerLogDiscoverer(t *testing.T) {
-	start := "[x INFO Worker] Version: 2.337.0\n"
-	save := func(repo, sha string) string {
-		return workerLine("Save archive 'https://codeload.github.com/actions/"+repo+"/tar.gz/"+sha+"' into x") +
+	// codeloadSave is a Save line followed by the request line a real Worker log carries after it.
+	codeloadSave := func(repo, sha string) string {
+		return savedLine("actions", repo, sha) +
 			"Request URL: https://codeload.github.com/actions/" + repo + "/tar.gz/" + sha + " X-GitHub-Request-Id: A\n"
 	}
-	t.Run("verify when no cache is configured then every action is downloaded with its SHA", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, map[string]string{
-			"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
-			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4),
-		}, []string{"actions/checkout/v4"})
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		require.Len(t, refs, 1)
-		assert.Equal(t, testShaV4, refs[0].RunnerSHA)
-	})
-	t.Run("verify when an earlier job planted a Worker log that sorts last then the runner's SHA still decides", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, map[string]string{
-			"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
-			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4),
-			"Worker_29991231-235959-utc.log": start + save("checkout", testShaV3),
-		}, []string{"actions/checkout/v4"})
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		require.Len(t, refs, 1)
-		assert.Equal(t, testShaV4, refs[0].RunnerSHA)
-	})
-	t.Run("verify when the logs name nothing then it falls back to the cache walk", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, map[string]string{"Worker_20261005-050652-utc.log": start},
-			[]string{"actions/checkout/v4"})
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		require.Len(t, refs, 1)
-		assert.Empty(t, refs[0].RunnerSHA)
-	})
-	t.Run("verify when the diag folder is unreadable then it falls back to the cache walk", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, nil, []string{"actions/checkout/v4"})
-		var refs []githubactions.ActionRef
-		out := captureLog(t, log.INFO, func() {
+	checkoutAndNode := jobFields("actions/checkout", "actions/setup-node")
+	checkoutTwiceAndNode := workerStart + savedLine("actions", "checkout", testShaV4) + savedLine("actions", "checkout", testShaV3) +
+		savedLine("actions", "setup-node", testShaNode)
+	attackerFirstDiag := map[string]string{
+		"pages/a_1.log": setupLine("attacker", "first", "v1", testShaEvil) + setupLine("jfrog", "curate", "v1", testShaSelf),
+		"Worker_20261005-050652-utc.log": workerStart + savedLine("attacker", "first", testShaEvil) +
+			savedLine("jfrog", "curate", testShaSelf),
+	}
+	checkoutTwice := workerStart + savedLine("actions", "checkout", testShaV4) + savedLine("actions", "checkout", testShaV3)
+
+	tests := []struct {
+		name      string
+		job       string            // extra job-message fields (see jobFields); "" leaves the timeline and steps unknown
+		diag      map[string]string // path under <runner>/_diag -> content; nil leaves no _diag folder
+		cacheDirs []string          // owner/repo/ref entries in _actions
+		sameAge   []string          // cacheDirs whose watermarks get one time, so age cannot pair them
+		mode      githubactions.CallerMode
+		self      string // the running action's owner/repo in githubactions.ModePre
+		want      map[string]refFacts
+		wantInLog map[string]int // substring -> exact number of times the log holds it
+	}{
+		// The fast path, and what keeps it off.
+		{
+			name: "verify when the setup lines cover every fetched action of a trusted job then each is decided by its logged SHA without walking the cache",
+			job:  jobFields("actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "checkout", "v3", testShaV3),
+				"Worker_20261005-050652-utc.log": checkoutTwice,
+			},
+			mode: githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4": {SHA: testShaV4, BySHA: true},
+				"actions/checkout@v3": {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
+			name:      "verify when the caller mode is unset then the logs never decide by SHA",
+			job:       checkoutAndNode,
+			diag:      trustedHookDiag,
+			cacheDirs: trustedHookCacheDirs,
+			want: map[string]refFacts{
+				"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
+			},
+		},
+		{
+			name: "verify when the setup lines cover only some fetched actions then the cache walk recovers the rest",
+			diag: map[string]string{
+				"blocks/b_1.log":                 setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": checkoutTwice,
+			},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3"},
+			want: map[string]refFacts{
+				"actions/checkout@v4": {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"actions/checkout@v3": {SHA: testShaV3, Reason: githubactions.ReasonLogUntrusted},
+			},
+		},
+		{
+			name:      "verify when the setup buffer is gone then a ref paired by elimination is decided by its logged SHA and only the ambiguous pair is compared",
+			job:       checkoutAndNode,
+			diag:      map[string]string{"Worker_20261005-050652-utc.log": checkoutTwiceAndNode},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"},
+			sameAge:   []string{"actions/checkout/v4", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
+				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		// Provenance rules: the whole job is compared by content.
+		{
+			name:      "verify when an earlier job planted a newer Worker log then every action is compared by content",
+			job:       checkoutAndNode,
+			diag:      withDiag(trustedHookDiag, plantedWorkerLog, "[x INFO Worker] continued\n"),
+			cacheDirs: trustedHookCacheDirs,
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
+			},
+		},
+		{
+			name: "verify when an earlier job planted a Worker log that sorts last then the runner's SHA still decides",
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart + codeloadSave("checkout", testShaV4),
+				"Worker_29991231-235959-utc.log": workerStart + codeloadSave("checkout", testShaV3),
+			},
+			cacheDirs: []string{"actions/checkout/v4"},
+			want:      map[string]refFacts{"actions/checkout@v4": {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted}},
+		},
+		{
+			name: "verify when the hook cannot read the job message then every action is compared by content",
+			job:  `, "timeline": {"id": "a"}, "steps": 5`,
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4),
+			},
+			cacheDirs: []string{"actions/checkout/v4"},
+			mode:      githubactions.ModeHook,
+			want:      map[string]refFacts{"actions/checkout@v4": {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted}},
+			wantInLog: map[string]int{"cannot be trusted": 1, "the job message could not be read": 1},
+		},
+		{
+			name:      "verify when another action runs before this pre then the job is compared by content",
+			job:       jobFields("attacker/first", "jfrog/curate"),
+			diag:      attackerFirstDiag,
+			cacheDirs: []string{"attacker/first/v1", "jfrog/curate/v1"},
+			mode:      githubactions.ModePre,
+			self:      "jfrog/curate",
+			want: map[string]refFacts{
+				"attacker/first@v1": {SHA: testShaEvil, Reason: githubactions.ReasonLogUntrusted},
+				"jfrog/curate@v1":   {SHA: testShaSelf, Reason: githubactions.ReasonLogUntrusted},
+			},
+		},
+		{
+			name:      "verify when this pre is the first step then the logged SHAs decide",
+			job:       jobFields("jfrog/curate", "attacker/first"),
+			diag:      attackerFirstDiag,
+			cacheDirs: []string{"attacker/first/v1", "jfrog/curate/v1"},
+			mode:      githubactions.ModePre,
+			self:      "jfrog/curate",
+			want: map[string]refFacts{
+				"attacker/first@v1": {SHA: testShaEvil, BySHA: true},
+				"jfrog/curate@v1":   {SHA: testShaSelf, BySHA: true},
+			},
+		},
+		{
+			name:      "verify when the diag folder is unreadable then it falls back to the cache walk",
+			cacheDirs: []string{"actions/checkout/v4"},
+			mode:      githubactions.ModeHook,
+			want:      map[string]refFacts{"actions/checkout@v4": {Reason: githubactions.ReasonLogUntrusted}},
+			wantInLog: map[string]int{"[Warn]": 1},
+		},
+		{
+			name:      "verify when the logs name nothing then it falls back to the cache walk",
+			diag:      map[string]string{"Worker_20261005-050652-utc.log": workerStart},
+			cacheDirs: []string{"actions/checkout/v4"},
+			want:      map[string]refFacts{"actions/checkout@v4": {Reason: githubactions.ReasonNoSHA}},
+		},
+		// Evidence rules: only the action concerned is compared by content.
+		{
+			name: "verify when a setup line of the job names a SHA the Worker never fetched then only that action is compared",
+			job:  checkoutAndNode,
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "setup-node", "v4", testShaEvil),
+				"Worker_20261005-050652-utc.log": trustedHookDiag["Worker_20261005-050652-utc.log"],
+			},
+			cacheDirs: trustedHookCacheDirs,
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":   {SHA: testShaV4, BySHA: true},
+				"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonStaleLine},
+			},
+		},
+		{
+			name: "verify when a stale setup line is for a repository outside the job then nothing changes",
+			job:  checkoutAndNode,
+			diag: withDiag(trustedHookDiag, "pages/a_1.log", trustedHookDiag["pages/a_1.log"]+
+				setupLine("attackerpre", "evil", "v9", testShaEvil)),
+			cacheDirs: trustedHookCacheDirs,
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":   {SHA: testShaV4, BySHA: true},
+				"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
+			},
+		},
+		{
+			name: "verify when an action came from a self-hosted cache whose writability is unknown then only that action is compared",
+			job:  checkoutAndNode,
+			diag: withDiag(trustedHookDiag, "Worker_20261005-050652-utc.log", workerStart+cachedLine("actions", "checkout", testShaV4)+
+				savedLine("actions", "setup-node", testShaNode)),
+			cacheDirs: trustedHookCacheDirs,
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonCacheSource},
+				"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
+			},
+			wantInLog: map[string]int{
+				"cannot be trusted": 0, // an evidence rule downgrades the action, not the job
+				"[Warn]":            1, // one warning names every downgraded action
+				`"actions/checkout@v4": ` + githubactions.ReasonCacheSource: 1,
+				"setup-node": 0,
+			},
+		},
+		// Pairing refs with logged commits: every logged commit is decided under its own name.
+		{
+			name:      "verify when a forged setup line hands one action another's SHA then that copy is compared and its own commit is decided by SHA",
+			job:       jobFields("aa/aa", "actions/checkout"),
+			diag:      swappedSHADiag,
+			cacheDirs: swappedSHACacheDirs,
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"aa/aa@v1":             {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
+				"actions/checkout@v4":  {SHA: testShaV4, BySHA: true},
+				"aa/aa#" + testShaEvil: {SHA: testShaEvil, BySHA: true},
+			},
+		},
+		{
+			name: "verify when the cache is walked then a stolen commit is decided under its own name",
+			job:  jobFields("aa/aa", "actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("aa", "aa", "v1", testShaV4) + setupLine("actions", "checkout", "v4", testShaV4) +
+					setupLine("actions", "checkout", "v3", testShaV3),
+				"Worker_20261005-050652-utc.log": checkoutTwice + savedLine("aa", "aa", testShaEvil),
+			},
+			cacheDirs: []string{"aa/aa/v1", "actions/checkout/v4", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"aa/aa@v1":                      {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4}},
+				"actions/checkout@v3":           {SHA: testShaV3, BySHA: true},
+				"aa/aa#" + testShaEvil:          {SHA: testShaEvil, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+			},
+		},
+		{
+			name: "verify when the setup lines account for the job then a stolen commit is decided under its own name",
+			job:  jobFields("aa/aa", "actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("aa", "aa", "v1", testShaV4) + setupLine("actions", "checkout", "v3", testShaV3),
+				"Worker_20261005-050652-utc.log": checkoutTwice,
+			},
+			cacheDirs: []string{"aa/aa/v1", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"aa/aa@v1":                      {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
+				"actions/checkout@v3":           {SHA: testShaV3, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+			},
+		},
+		{
+			name: "verify when the job is untrusted then a logged commit no folder holds is still decided by SHA",
+			job:  jobFields("actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": checkoutTwice,
+				plantedWorkerLog:                 "[x INFO Worker] continued\n",
+			},
+			cacheDirs: []string{"actions/checkout/v4"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
+			name: "verify when a repository was renamed then its folder is compared and the commit is decided under the new name",
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("oldowner", "tool", "v1", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart +
+					workerLine("Save archive 'https://api.github.com/repos/newowner/tool/tarball/"+testShaV4+"' into x"),
+			},
+			cacheDirs: []string{"oldowner/tool/v1"},
+			want: map[string]refFacts{
+				"oldowner/tool@v1":           {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"newowner/tool#" + testShaV4: {SHA: testShaV4, BySHA: true},
+			},
+		},
+		{
+			name: "verify when the runner fetched an action that is not in the cache then its commit is decided by SHA",
+			// A renamed repository with no setup line, or a Worker line a remote composite's docker://
+			// image forged: either way the commit is decided by its SHA and every folder by its own.
+			diag: map[string]string{
+				"Worker_20261005-050652-utc.log": workerStart + codeloadSave("checkout", testShaV4) + codeloadSave("setup-node", testShaV3),
+			},
+			cacheDirs: []string{"actions/checkout/v4"},
+			want: map[string]refFacts{
+				"actions/checkout@v4":             {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
+				"actions/setup-node#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+			wantInLog: map[string]int{`"actions/setup-node@` + testShaV3 + `"`: 1},
+		},
+		// Logged commits handed to the decider for a ref the logs could not pair.
+		{
+			name: "verify when the job is trusted then only the unpaired refs carry their repository's logged commits",
+			job:  checkoutAndNode,
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("actions", "setup-node", "v4", testShaNode),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", strings.ToUpper(testShaV4)) +
+					savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode),
+			},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"},
+			sameAge:   []string{"actions/checkout/v4", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
+				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
+			name: "verify when a logged commit came from a writable cache on a self-hosted runner then no ref is paired with it through the refs list",
+			job:  checkoutAndNode,
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("actions", "setup-node", "v4", testShaNode),
+				"Worker_20261005-050652-utc.log": workerStart + cachedLine("actions", "checkout", testShaV4) +
+					savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode),
+			},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"},
+			sameAge:   []string{"actions/checkout/v4", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
+			name: "verify when the job is untrusted then no ref carries logged commits",
+			job:  checkoutAndNode,
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("actions", "setup-node", "v4", testShaNode),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", strings.ToUpper(testShaV4)) +
+					savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode),
+				plantedWorkerLog: "[x INFO Worker] continued\n",
+			},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"},
+			sameAge:   []string{"actions/checkout/v4", "actions/checkout/v3"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA},
+				"actions/setup-node@v4":         {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
+				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+		{
+			name: "verify when another folder already holds a logged commit then the unpaired refs are offered only the rest",
+			job:  jobFields("actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": checkoutTwice,
+			},
+			cacheDirs: []string{"actions/checkout/v4", "actions/checkout/v3", "actions/checkout/main"},
+			sameAge:   []string{"actions/checkout/v3", "actions/checkout/main"},
+			mode:      githubactions.ModeHook,
+			want: map[string]refFacts{
+				"actions/checkout@v4":           {SHA: testShaV4, BySHA: true},
+				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/checkout@main":         {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
+				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runnerDir, cacheDir := hookRunnerForJob(t, tt.job, tt.diag, tt.cacheDirs)
+			same := time.Now()
+			for _, dir := range tt.sameAge {
+				require.NoError(t, os.Chtimes(filepath.Join(cacheDir, filepath.FromSlash(dir)+".completed"), same, same))
+			}
+			var refs []githubactions.ActionRef
 			var err error
-			refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
+			out := captureLog(t, log.INFO, func() {
+				refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: tt.mode, self: tt.self}.Discover()
+			})
 			require.NoError(t, err)
+			assert.Len(t, refs, len(tt.want), "Discover() refs")
+			assert.Equal(t, tt.want, factsOf(refs))
+			for s, n := range tt.wantInLog {
+				assert.Equal(t, n, strings.Count(out, s), "times the log holds %q:\n%s", s, out)
+			}
 		})
-		require.Len(t, refs, 1)
-		assert.Equal(t, githubactions.ReasonLogUntrusted, refs[0].ContentReason)
-		assert.Equal(t, 1, strings.Count(out, "[Warn]"), "one warning carries the error: %s", out)
-	})
-	t.Run("verify when the runner fetched an action that is not in the cache then its commit is decided by SHA", func(t *testing.T) {
-		// A renamed repository with no setup line, or a Worker line a remote composite's docker://
-		// image forged: either way the commit is decided by its SHA and every folder by its own.
-		runnerDir, cacheDir := hookRunner(t, map[string]string{
-			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4) + save("setup-node", testShaV3),
-		}, []string{"actions/checkout/v4"})
-		var refs []githubactions.ActionRef
-		out := captureLog(t, log.INFO, func() {
-			var err error
-			refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-			require.NoError(t, err)
-		})
-		assert.Equal(t, map[string]refFacts{
-			"actions/checkout@v4":             {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-			"actions/setup-node#" + testShaV3: {SHA: testShaV3, BySHA: true},
-		}, factsOf(refs))
-		assert.Contains(t, out, `"actions/setup-node@`+testShaV3+`"`, "one warning names the commit, quoted: %s", out)
-	})
-	t.Run("verify when a ref cannot be recovered then it is still curated without a runner SHA", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, map[string]string{
-			"Worker_20261005-050652-utc.log": start + save("checkout", testShaV4) + save("checkout", testShaV3),
-		}, []string{"actions/checkout/v4", "actions/checkout/v3"})
-		same := time.Now()
-		for _, ref := range []string{"v4", "v3"} {
-			require.NoError(t, os.Chtimes(filepath.Join(cacheDir, "actions", "checkout", ref+".completed"), same, same))
-		}
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		assert.Equal(t, map[string]refFacts{
-			"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA},
-			"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA},
-			"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-			"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-		}, factsOf(refs), "each logged commit is still decided, by its SHA")
-	})
-}
-
-func TestCurationActionsCommand_Run_HookModeReportHasTheStepModeColumns(t *testing.T) {
-	pinRunnerEnv(t, "octo/repo", "", "")
-	runnerDir, cacheDir := hookRunner(t, map[string]string{
-		"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
-		"Worker_20261005-050652-utc.log": "[x INFO Worker] Version: 2.337.0\n" + workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+testShaV4+"' into x"),
-	}, []string{"actions/checkout/v4"})
-	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "").SetDecider(&scriptedDecider{})
-	report, err := captureReport(t, cmd)
-	require.NoError(t, err)
-	assert.Contains(t, report, "| Action | Ref | Status | Notes |")
-	assert.NotContains(t, report, "Runner SHA")
-}
-
-func TestRunnerLogDiscovererAcceptsARenamedRepository(t *testing.T) {
-	runnerDir, cacheDir := hookRunner(t, map[string]string{
-		"pages/a_1.log":                  "Download action repository 'oldowner/tool@v1' (SHA:" + testShaV4 + ")\n",
-		"Worker_20261005-050652-utc.log": "[x INFO Worker] Version: 2.337.0\n" + workerLine("Save archive 'https://api.github.com/repos/newowner/tool/tarball/"+testShaV4+"' into x"),
-	}, []string{"oldowner/tool/v1"})
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"oldowner/tool@v1":           {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-		"newowner/tool#" + testShaV4: {SHA: testShaV4, BySHA: true},
-	}, factsOf(refs), "the folder is compared, and the commit is decided under the name GitHub resolved")
-}
-
-func TestCurationActionsCommand_Run_HookModeDoesNotAttributeFromTheWorkspace(t *testing.T) {
-	// At job start a persistent runner's workspace still holds the previous run's checkout, so a
-	// workflow file found there may not be this job's. Hook mode must not attribute from it, nor
-	// drop the caveat about local composite actions it cannot see.
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	spec := runnerSpec{
-		cacheDirs:    []string{"actions/checkout/v4"},
-		workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n",
 	}
-	runnerDir, _ := hookRunner(t, map[string]string{
-		"Worker_20261005-050652-utc.log": "[x INFO Worker] Version: 2.337.0\n" + workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+testShaV4+"' into x"),
-	}, nil)
-	cmd := spec.newCommand(t, writtenWorkflowFile, "build", &scriptedDecider{}).SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "")
-	report, err := captureReport(t, cmd)
-	require.NoError(t, err)
-	assert.NotContains(t, report, "| Parent |")
-	assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
-}
-
-func TestRunnerLogDiscovererSetupLineCoverage(t *testing.T) {
-	start := "[x INFO Worker] Version: 2.337.0\n"
-	save := func(sha string) string {
-		return workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/" + sha + "' into x")
-	}
-	setup := func(ref, sha string) string {
-		return "Download action repository 'actions/checkout@" + ref + "' (SHA:" + sha + ")\n"
-	}
-	t.Run("verify when the setup lines cover every fetched action of a trusted job then the cache is not walked", func(t *testing.T) {
-		runnerDir, _ := hookRunnerForJob(t, jobFields("actions/checkout"), map[string]string{
-			"pages/a_1.log":                  setup("v4", testShaV4) + setup("v3", testShaV3),
-			"Worker_20261005-050652-utc.log": start + save(testShaV4) + save(testShaV3),
-		}, nil)
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: filepath.Join(runnerDir, "no-such-cache"),
-			mode: githubactions.ModeHook}.Discover()
-		require.NoError(t, err)
-		got := map[string]string{}
-		for _, r := range refs {
-			got[r.Owner+"/"+r.Repo+"@"+r.Ref] = r.RunnerSHA
-		}
-		assert.Equal(t, map[string]string{
-			"actions/checkout@v4": testShaV4,
-			"actions/checkout@v3": testShaV3,
-		}, got)
-	})
-	t.Run("verify when the setup lines cover only some fetched actions then the cache walk recovers the rest", func(t *testing.T) {
-		runnerDir, cacheDir := hookRunner(t, map[string]string{
-			"blocks/b_1.log":                 setup("v4", testShaV4),
-			"Worker_20261005-050652-utc.log": start + save(testShaV4) + save(testShaV3),
-		}, []string{"actions/checkout/v4", "actions/checkout/v3"})
-		refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-		require.NoError(t, err)
-		got := map[string]string{}
-		for _, r := range refs {
-			got[r.Ref] = r.RunnerSHA
-		}
-		assert.Equal(t, map[string]string{"v4": testShaV4, "v3": testShaV3}, got)
-	})
-}
-
-func TestCurationActionsCommand_Run_StepSummary(t *testing.T) {
-	logs := map[string]string{
-		"pages/a_1.log":                  "Download action repository 'actions/checkout@v4' (SHA:" + testShaV4 + ")\n",
-		"Worker_20261005-050652-utc.log": "[x INFO Worker] Version: 2.337.0\n" + workerLine("Save archive 'https://codeload.github.com/actions/checkout/tar.gz/"+testShaV4+"' into x"),
-	}
-	// stepSummary is the file the runner hands the hook, already holding what an earlier hook wrote.
-	stepSummary := func(t *testing.T) string {
-		path := filepath.Join(t.TempDir(), "step_summary.md")
-		require.NoError(t, os.WriteFile(path, []byte("earlier hook\n"), 0o644))
-		t.Setenv(stepSummaryEnvVar, path)
-		return path
-	}
-	t.Run("verify when run as the hook then the report is appended to the runner's step summary", func(t *testing.T) {
-		pinRunnerEnv(t, "octo/repo", "", "")
-		path := stepSummary(t)
-		runnerDir, cacheDir := hookRunner(t, logs, []string{"actions/checkout/v4"})
-		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "").SetDecider(&scriptedDecider{})
-		_, err := captureReport(t, cmd)
-		require.NoError(t, err)
-		content, err := os.ReadFile(path)
-		require.NoError(t, err)
-		assert.True(t, strings.HasPrefix(string(content), "earlier hook\n"), "the summary must be appended, not replace what is there")
-		assert.Contains(t, string(content), "GitHub Actions Curation")
-		assert.Contains(t, string(content), "| actions/checkout | v4 |")
-	})
-	t.Run("verify when run as a step then the step summary is left to setup-jfrog-cli", func(t *testing.T) {
-		pinRunnerEnv(t, "octo/repo", "", "")
-		path := stepSummary(t)
-		_, cacheDir := hookRunner(t, logs, []string{"actions/checkout/v4"})
-		cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{})
-		_, err := captureReport(t, cmd)
-		require.NoError(t, err)
-		content, err := os.ReadFile(path)
-		require.NoError(t, err)
-		assert.Equal(t, "earlier hook\n", string(content))
-	})
 }
 
 // workerLine returns message as the runner writes it into the Worker log.
@@ -409,316 +610,38 @@ func setupLine(owner, repo, ref, sha string) string {
 
 const workerStart = "[x INFO Worker] Version: 2.337.0\n"
 
-// trustedHookJob is a job a hook can trust: checkout and setup-node, each logged by the Worker and
-// named by a setup line.
-func trustedHookJob(t *testing.T) (runnerDir, cacheDir string) {
-	t.Helper()
-	return hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), map[string]string{
+// trustedHookDiag and trustedHookCacheDirs are a job a hook can trust: checkout and setup-node, each
+// logged by the Worker and named by a setup line.
+var (
+	trustedHookDiag = map[string]string{
 		"pages/a_1.log": setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "setup-node", "v4", testShaNode),
 		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
 			savedLine("actions", "setup-node", testShaNode),
-	}, []string{"actions/checkout/v4", "actions/setup-node/v4"})
-}
+	}
+	trustedHookCacheDirs = []string{"actions/checkout/v4", "actions/setup-node/v4"}
+)
 
-func TestRunnerLogDiscovererApprovesByLoggedSHAWhenTrusted(t *testing.T) {
-	runnerDir, cacheDir := trustedHookJob(t)
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":   {SHA: testShaV4, BySHA: true},
-		"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
-	}, factsOf(refs))
-}
-
-func TestRunnerLogDiscovererUnsetModeNeverUsesTheFastPath(t *testing.T) {
-	runnerDir, cacheDir := trustedHookJob(t)
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-		"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
-	}, factsOf(refs))
-}
-
-func TestRunnerLogDiscovererStaleSetupLineDowngradesThatAction(t *testing.T) {
-	worker := workerStart + savedLine("actions", "checkout", testShaV4) + savedLine("actions", "setup-node", testShaNode)
-	tests := []struct {
-		name  string
-		lines string
-		want  map[string]refFacts
-	}{
-		{
-			name:  "verify when a setup line of the job names a SHA the Worker never fetched then only that action is compared",
-			lines: setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "setup-node", "v4", testShaEvil),
-			want: map[string]refFacts{
-				"actions/checkout@v4":   {SHA: testShaV4, BySHA: true},
-				"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonStaleLine},
-			},
-		},
-		{
-			name: "verify when the stale line is for a repository outside the job then nothing changes",
-			lines: setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "setup-node", "v4", testShaNode) +
-				setupLine("attackerpre", "evil", "v9", testShaEvil),
-			want: map[string]refFacts{
-				"actions/checkout@v4":   {SHA: testShaV4, BySHA: true},
-				"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), map[string]string{
-				"pages/a_1.log":                  tt.lines,
-				"Worker_20261005-050652-utc.log": worker,
-			}, []string{"actions/checkout/v4", "actions/setup-node/v4"})
-			refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, factsOf(refs))
-		})
-	}
-}
-
-func TestRunnerLogDiscovererAttackerFirstDowngradesInPreMode(t *testing.T) {
-	diag := map[string]string{
-		"pages/a_1.log": setupLine("attacker", "first", "v1", testShaEvil) + setupLine("jfrog", "curate", "v1", testShaSelf),
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("attacker", "first", testShaEvil) +
-			savedLine("jfrog", "curate", testShaSelf),
-	}
-	cacheDirs := []string{"attacker/first/v1", "jfrog/curate/v1"}
-	tests := []struct {
-		name  string
-		steps []string
-		want  map[string]refFacts
-	}{
-		{
-			name:  "verify when another action runs before this one then the job is compared by content",
-			steps: []string{"attacker/first", "jfrog/curate"},
-			want: map[string]refFacts{
-				"attacker/first@v1": {SHA: testShaEvil, Reason: githubactions.ReasonLogUntrusted},
-				"jfrog/curate@v1":   {SHA: testShaSelf, Reason: githubactions.ReasonLogUntrusted},
-			},
-		},
-		{
-			name:  "verify when this action is the first step then the logged SHAs decide",
-			steps: []string{"jfrog/curate", "attacker/first"},
-			want: map[string]refFacts{
-				"attacker/first@v1": {SHA: testShaEvil, BySHA: true},
-				"jfrog/curate@v1":   {SHA: testShaSelf, BySHA: true},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			runnerDir, cacheDir := hookRunnerForJob(t, jobFields(tt.steps...), diag, cacheDirs)
-			refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModePre, self: "jfrog/curate"}.Discover()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, factsOf(refs))
-		})
-	}
-}
-
-func TestRunnerLogDiscovererLoggedSHAsOfARefWithoutARunnerSHA(t *testing.T) {
-	// Two checkout folders of one age and no setup line: nothing pairs either with a logged commit,
-	// so each carries the repository's logged commits for the decider to pair through the refs list.
-	diag := func(extra map[string]string) map[string]string {
-		diag := map[string]string{
-			"pages/a_1.log": setupLine("actions", "setup-node", "v4", testShaNode),
-			"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", strings.ToUpper(testShaV4)) +
-				savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode),
-		}
-		for k, v := range extra {
-			diag[k] = v
-		}
-		return diag
-	}
-	cacheDirs := []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"}
-	tests := []struct {
-		name  string
-		extra map[string]string
-		want  map[string]refFacts
-	}{
-		{
-			name: "verify when the job is trusted then only the unpaired refs carry their repository's logged commits",
-			want: map[string]refFacts{
-				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
-				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
-				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
-				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-			},
-		},
-		{
-			name: "verify when a logged commit came from a writable cache on a self-hosted runner then no ref is paired with it through the refs list",
-			extra: map[string]string{"Worker_20261005-050652-utc.log": workerStart + cachedLine("actions", "checkout", testShaV4) +
-				savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode)},
-			want: map[string]refFacts{
-				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
-				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
-				"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
-				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-			},
-		},
-		{
-			name:  "verify when the job is untrusted then no ref carries logged commits",
-			extra: map[string]string{plantedWorkerLog: "[x INFO Worker] continued\n"},
-			want: map[string]refFacts{
-				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA},
-				"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA},
-				"actions/setup-node@v4":         {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
-				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-				"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), diag(tt.extra), cacheDirs)
-			same := time.Now()
-			for _, ref := range []string{"v4", "v3"} {
-				require.NoError(t, os.Chtimes(filepath.Join(cacheDir, "actions", "checkout", ref+".completed"), same, same))
-			}
-			refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, factsOf(refs))
-		})
-	}
-}
-
-func TestRunnerLogDiscovererLoggedSHAsLeaveOutACommitPairedWithAnotherFolder(t *testing.T) {
-	// The setup line pairs v4 with its commit; main and v3 are of one age and stay unpaired, so only
-	// the commit no folder holds is left for the refs list to pair them with.
-	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout"), map[string]string{
-		"pages/a_1.log": setupLine("actions", "checkout", "v4", testShaV4),
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
-			savedLine("actions", "checkout", testShaV3),
-	}, []string{"actions/checkout/v4", "actions/checkout/v3", "actions/checkout/main"})
-	same := time.Now()
-	for _, ref := range []string{"v3", "main"} {
-		require.NoError(t, os.Chtimes(filepath.Join(cacheDir, "actions", "checkout", ref+".completed"), same, same))
-	}
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":           {SHA: testShaV4, BySHA: true},
-		"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
-		"actions/checkout@main":         {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV3}},
-		"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-	}, factsOf(refs))
-}
-
-func TestRunnerLogDiscovererAmbiguousPairLeavesOnlyThatActionOnContent(t *testing.T) {
-	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), map[string]string{
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
-			savedLine("actions", "checkout", testShaV3) + savedLine("actions", "setup-node", testShaNode),
-	}, []string{"actions/checkout/v4", "actions/checkout/v3", "actions/setup-node/v4"})
-	same := time.Now()
-	for _, ref := range []string{"v4", "v3"} {
-		require.NoError(t, os.Chtimes(filepath.Join(cacheDir, "actions", "checkout", ref+".completed"), same, same))
-	}
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
-		"actions/checkout@v3":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4, testShaV3}},
-		"actions/setup-node@v4":         {SHA: testShaNode, BySHA: true},
-		"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-		"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-	}, factsOf(refs))
-}
-
-// swappedSHAJob is a job whose aa/aa folder holds the commit the Worker logged as testShaEvil, while
-// a forged setup line hands it testShaV4, which the Worker logged for actions/checkout. aa/aa sorts
-// first, so the forged line is read before checkout's own.
-func swappedSHAJob(t *testing.T) (runnerDir, cacheDir string) {
+// trustedHookJob lays out trustedHookDiag for the job of checkout and setup-node.
+func trustedHookJob(t *testing.T) (runnerDir, cacheDir string) {
 	t.Helper()
-	return hookRunnerForJob(t, jobFields("aa/aa", "actions/checkout"), map[string]string{
+	return hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), trustedHookDiag, trustedHookCacheDirs)
+}
+
+// swappedSHADiag and swappedSHACacheDirs are a job whose aa/aa folder holds the commit the Worker
+// logged as testShaEvil, while a forged setup line hands it testShaV4, which the Worker logged for
+// actions/checkout. aa/aa sorts first, so the forged line is read before checkout's own.
+var (
+	swappedSHADiag = map[string]string{
 		"pages/a_1.log": setupLine("aa", "aa", "v1", testShaV4) + setupLine("actions", "checkout", "v4", testShaV4),
 		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
 			savedLine("aa", "aa", testShaEvil),
-	}, []string{"aa/aa/v1", "actions/checkout/v4"})
-}
-
-func TestRunnerLogDiscovererSwappedSHAIsStillDecided(t *testing.T) {
-	runnerDir, cacheDir := swappedSHAJob(t)
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"aa/aa@v1":             {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
-		"actions/checkout@v4":  {SHA: testShaV4, BySHA: true},
-		"aa/aa#" + testShaEvil: {SHA: testShaEvil, BySHA: true},
-	}, factsOf(refs))
-}
+	}
+	swappedSHACacheDirs = []string{"aa/aa/v1", "actions/checkout/v4"}
+)
 
 // plantedWorkerLog is a Worker log newer than the job's own and without a start line, which a job
 // could have written.
 const plantedWorkerLog = "Worker_20261005-060000-utc.log"
-
-func TestRunnerLogDiscovererUnpairedLoggedSHAIsDecidedBySHAEvenWhenUntrusted(t *testing.T) {
-	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout"), map[string]string{
-		"pages/a_1.log": setupLine("actions", "checkout", "v4", testShaV4),
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) +
-			savedLine("actions", "checkout", testShaV3),
-		plantedWorkerLog: "[x INFO Worker] continued\n",
-	}, []string{"actions/checkout/v4"})
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":           {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-		"actions/checkout#" + testShaV3: {SHA: testShaV3, BySHA: true},
-	}, factsOf(refs))
-}
-
-func TestRunnerLogDiscovererUnreadableJobMessageInHookDowngrades(t *testing.T) {
-	runnerDir, cacheDir := hookRunnerForJob(t, `, "timeline": {"id": "a"}, "steps": 5`, map[string]string{
-		"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4),
-	}, []string{"actions/checkout/v4"})
-	var refs []githubactions.ActionRef
-	out := captureLog(t, log.INFO, func() {
-		var err error
-		refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-		require.NoError(t, err)
-	})
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4": {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-	}, factsOf(refs))
-	assert.Equal(t, 1, strings.Count(out, "cannot be trusted"), "one warning per untrusted job: %s", out)
-	assert.Contains(t, out, "the job message could not be read")
-}
-
-func TestRunnerLogDiscovererPlantedWorkerFileDowngrades(t *testing.T) {
-	runnerDir, cacheDir := trustedHookJob(t)
-	require.NoError(t, os.WriteFile(filepath.Join(runnerDir, "_diag", plantedWorkerLog), []byte("[x INFO Worker] continued\n"), 0o644))
-	refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted},
-		"actions/setup-node@v4": {SHA: testShaNode, Reason: githubactions.ReasonLogUntrusted},
-	}, factsOf(refs))
-}
-
-func TestRunnerLogDiscovererCacheSourceOnSelfHostedDowngradesThatActionOnly(t *testing.T) {
-	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("actions/checkout", "actions/setup-node"), map[string]string{
-		"pages/a_1.log": setupLine("actions", "checkout", "v4", testShaV4) + setupLine("actions", "setup-node", "v4", testShaNode),
-		"Worker_20261005-050652-utc.log": workerStart + cachedLine("actions", "checkout", testShaV4) +
-			savedLine("actions", "setup-node", testShaNode),
-	}, []string{"actions/checkout/v4", "actions/setup-node/v4"})
-	var refs []githubactions.ActionRef
-	out := captureLog(t, log.INFO, func() {
-		var err error
-		refs, err = runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-		require.NoError(t, err)
-	})
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4":   {SHA: testShaV4, Reason: githubactions.ReasonCacheSource},
-		"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
-	}, factsOf(refs))
-	assert.NotContains(t, out, "cannot be trusted", "an evidence rule downgrades the action, not the job")
-	assert.Equal(t, 1, strings.Count(out, "[Warn]"), "one warning names every downgraded action: %s", out)
-	assert.Contains(t, out, `"actions/checkout@v4": `+githubactions.ReasonCacheSource)
-	assert.NotContains(t, out, "setup-node")
-}
 
 // checkoutArchiveCache is an archive cache holding actions/checkout at testShaV4, made read-only by
 // its owner, the user running the test, when readOnly is set. Write permission is restored on cleanup
@@ -779,6 +702,7 @@ func TestRunnerLogDiscovererCacheSourceTrust(t *testing.T) {
 			refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook,
 				trustActionCache: tt.trustActionCache}.Discover()
 			require.NoError(t, err)
+			assert.Len(t, refs, 2, "Discover() refs")
 			assert.Equal(t, map[string]refFacts{
 				"actions/checkout@v4":   tt.wantCheckout,
 				"actions/setup-node@v4": {SHA: testShaNode, BySHA: true},
@@ -812,63 +736,13 @@ func TestAssessmentReasonsAreSanitised(t *testing.T) {
 	}
 }
 
-func TestRunnerLogDiscovererDecidesEveryLoggedCommitUnderItsOwnName(t *testing.T) {
-	// A forged line hands aa/aa checkout's testShaV4. Checkout logged two commits, so no other rule
-	// gives testShaV4 back to a checkout folder; it must still be decided as checkout's.
-	worker := workerStart + savedLine("actions", "checkout", testShaV4) + savedLine("actions", "checkout", testShaV3)
-	tests := []struct {
-		name      string
-		lines     string
-		worker    string
-		cacheDirs []string
-		want      map[string]refFacts
-	}{
-		{
-			name: "verify when the cache is walked then the stolen commit is decided under its own name",
-			lines: setupLine("aa", "aa", "v1", testShaV4) + setupLine("actions", "checkout", "v4", testShaV4) +
-				setupLine("actions", "checkout", "v3", testShaV3),
-			worker:    worker + savedLine("aa", "aa", testShaEvil),
-			cacheDirs: []string{"aa/aa/v1", "actions/checkout/v4", "actions/checkout/v3"},
-			want: map[string]refFacts{
-				"aa/aa@v1":                      {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
-				"actions/checkout@v4":           {Reason: githubactions.ReasonNoSHA, Logged: []string{testShaV4}},
-				"actions/checkout@v3":           {SHA: testShaV3, BySHA: true},
-				"aa/aa#" + testShaEvil:          {SHA: testShaEvil, BySHA: true},
-				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-			},
-		},
-		{
-			name:      "verify when the setup lines account for the job then the stolen commit is decided under its own name",
-			lines:     setupLine("aa", "aa", "v1", testShaV4) + setupLine("actions", "checkout", "v3", testShaV3),
-			worker:    worker,
-			cacheDirs: []string{"aa/aa/v1", "actions/checkout/v3"},
-			want: map[string]refFacts{
-				"aa/aa@v1":                      {SHA: testShaV4, Reason: githubactions.ReasonRenamed},
-				"actions/checkout@v3":           {SHA: testShaV3, BySHA: true},
-				"actions/checkout#" + testShaV4: {SHA: testShaV4, BySHA: true},
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			runnerDir, cacheDir := hookRunnerForJob(t, jobFields("aa/aa", "actions/checkout"), map[string]string{
-				"pages/a_1.log":                  tt.lines,
-				"Worker_20261005-050652-utc.log": tt.worker,
-			}, tt.cacheDirs)
-			refs, err := runnerLogDiscoverer{runnerDir: runnerDir, actionsCacheDir: cacheDir, mode: githubactions.ModeHook}.Discover()
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, factsOf(refs))
-		})
-	}
-}
-
 func TestCurationActionsCommand_Run_HookModeForgedSetupLineCannotApproveAnEvilCopy(t *testing.T) {
 	// The real decider: the forged line hands aa/aa's evil copy checkout's approved SHA, so the copy
 	// is compared at that SHA and fails, and the commit the Worker really fetched for aa/aa is decided too.
 	const vcsRepo = "github-vcs"
 	pinRunnerEnv(t, testGithubRepo, "", "")
 	t.Setenv(stepSummaryEnvVar, "")
-	runnerDir, cacheDir := swappedSHAJob(t)
+	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("aa/aa", "actions/checkout"), swappedSHADiag, swappedSHACacheDirs)
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "aa", "aa", "v1", "action.yml"), []byte("name: evil\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "actions", "checkout", "v4", "action.yml"), []byte("name: checkout\n"), 0o644))
 	approved := actionTarGz(t, map[string]string{"action.yml": "name: checkout\n"})
@@ -924,76 +798,107 @@ func (r *refRecorder) Decide(_ context.Context, _ string, ref githubactions.Acti
 	return githubactions.ActionCurationResult{Status: githubactions.ActionApproved}, nil
 }
 
-func TestCurationActionsCommand_Run_FromPreWithAnInvisibleRunnerComparesEveryActionByContent(t *testing.T) {
-	// A container job: the Worker is not in the process tree, so the pre has only the action cache.
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
-	summary := filepath.Join(t.TempDir(), "step_summary.md")
-	t.Setenv(stepSummaryEnvVar, summary)
-	spec := runnerSpec{
-		cacheDirs:    []string{"actions/checkout/v4", "jfrog/curate/v1"},
-		workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: jfrog/curate@v1\n      - uses: actions/checkout@v4\n",
+func TestCurationActionsCommand_Run_CallerMode(t *testing.T) {
+	// The workspace holds a previous run's checkout at job start, so its workflow file may not be this
+	// job's: only a step attributes from it.
+	const previousRunWorkflow = "jobs:\n  build:\n    steps:\n      - uses: jfrog/curate@v1\n      - uses: actions/checkout@v4\n"
+	tests := []struct {
+		name                string
+		mode                githubactions.CallerMode // the zero value runs as a step; ModePre runs with --from-pre
+		runnerVisible       bool                     // ModePre only: the finder returns the runner rather than ErrRunnerNotVisible
+		job                 string                   // extra job-message fields (see jobFields)
+		diag                map[string]string        // path under <runner>/_diag -> content
+		cacheDirs           []string                 // owner/repo/ref entries in _actions
+		wantRefs            map[string]refFacts      // what the decider was asked, and how each was to be verified
+		wantParent          bool                     // the report attributes each action to the workflow step that uses it
+		wantInReport        []string
+		wantSummaryAppended bool // the report is appended to GITHUB_STEP_SUMMARY; otherwise the file is left as it was
+	}{
+		{
+			name:       "verify when run as a step then it attributes from the workflow file and leaves the step summary to setup-jfrog-cli",
+			cacheDirs:  []string{"jfrog/curate/v1", "actions/checkout/v4"},
+			wantRefs:   map[string]refFacts{"jfrog/curate@v1": {}, "actions/checkout@v4": {}},
+			wantParent: true,
+		},
+		{
+			name: "verify when run as the hook then it does not attribute from the workspace and appends the report to the step summary",
+			mode: githubactions.ModeHook,
+			diag: map[string]string{
+				"pages/a_1.log":                  setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4),
+			},
+			cacheDirs:           []string{"actions/checkout/v4"},
+			wantRefs:            map[string]refFacts{"actions/checkout@v4": {SHA: testShaV4, Reason: githubactions.ReasonLogUntrusted}},
+			wantInReport:        []string{"Local composite actions (uses: ./...) are not curated"},
+			wantSummaryAppended: true,
+		},
+		{
+			name:                "verify when a pre cannot see the runner then every action is compared by content",
+			mode:                githubactions.ModePre,
+			cacheDirs:           []string{"jfrog/curate/v1", "actions/checkout/v4"},
+			wantRefs:            map[string]refFacts{"jfrog/curate@v1": {Reason: githubactions.ReasonNoSHA}, "actions/checkout@v4": {Reason: githubactions.ReasonNoSHA}},
+			wantInReport:        []string{"not visible"},
+			wantSummaryAppended: true,
+		},
+		{
+			// checkout came from the runner's action cache, which on a GitHub-hosted runner no earlier job wrote.
+			name:          "verify when a pre is the job's first step on a hosted runner then every action is decided by its logged SHA",
+			mode:          githubactions.ModePre,
+			runnerVisible: true,
+			job:           jobFields("jfrog/curate", "actions/checkout"),
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("jfrog", "curate", "v1", testShaSelf) + setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("jfrog", "curate", testShaSelf) +
+					cachedLine("actions", "checkout", testShaV4),
+			},
+			cacheDirs:           []string{"jfrog/curate/v1", "actions/checkout/v4"},
+			wantRefs:            map[string]refFacts{"jfrog/curate@v1": {SHA: testShaSelf, BySHA: true}, "actions/checkout@v4": {SHA: testShaV4, BySHA: true}},
+			wantSummaryAppended: true,
+		},
 	}
-	decider := &refRecorder{}
-	cmd := spec.newCommand(t, writtenWorkflowFile, "build", decider).SetFromPre(true)
-	cmd.runnerDirFinder = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, "", "")
+			t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+			t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+			summary := filepath.Join(t.TempDir(), "step_summary.md")
+			require.NoError(t, os.WriteFile(summary, []byte("earlier hook\n"), 0o644))
+			t.Setenv(stepSummaryEnvVar, summary)
+			workingDir, _ := runnerSpec{workflowYAML: previousRunWorkflow}.build(t)
+			runnerDir, cacheDir := hookRunnerForJob(t, tt.job, tt.diag, tt.cacheDirs)
+			decider := &refRecorder{}
+			cmd := NewCurationActionsCommand().SetWorkingDir(workingDir).SetActionsCacheDir(cacheDir).SetDecider(decider).
+				SetWorkflowFile(filepath.Join(workingDir, ".github", "workflows", "ci.yml")).SetJobID("build")
+			switch tt.mode {
+			case githubactions.ModeHook:
+				cmd.SetRunnerDir(runnerDir).SetCallerMode(githubactions.ModeHook, "")
+			case githubactions.ModePre:
+				cmd.SetFromPre(true)
+				cmd.runnerDirFinder = func() (string, error) {
+					if !tt.runnerVisible {
+						return "", githubactions.ErrRunnerNotVisible
+					}
+					return runnerDir, nil
+				}
+			}
 
-	report, err := captureReport(t, cmd)
+			report, err := captureReport(t, cmd)
 
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"actions/checkout@v4": {Reason: githubactions.ReasonNoSHA},
-		"jfrog/curate@v1":     {Reason: githubactions.ReasonNoSHA},
-	}, factsOf(decider.refs))
-	assert.Contains(t, report, "not visible")
-	assert.NotContains(t, report, "| Parent |", "a pre runs before any checkout, so the workspace's workflow file is not this job's")
-	content, err := os.ReadFile(summary)
-	require.NoError(t, err)
-	assert.Contains(t, string(content), "| actions/checkout | v4 |")
-}
-
-func TestCurationActionsCommand_Run_FromPreAsTheFirstStepDecidesByLoggedSHA(t *testing.T) {
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
-	t.Setenv(stepSummaryEnvVar, "")
-	// checkout came from the runner's action cache, which on a GitHub-hosted runner no earlier job wrote.
-	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("jfrog/curate", "actions/checkout"), map[string]string{
-		"pages/a_1.log": setupLine("jfrog", "curate", "v1", testShaSelf) + setupLine("actions", "checkout", "v4", testShaV4),
-		"Worker_20261005-050652-utc.log": workerStart + savedLine("jfrog", "curate", testShaSelf) +
-			cachedLine("actions", "checkout", testShaV4),
-	}, []string{"jfrog/curate/v1", "actions/checkout/v4"})
-	decider := &refRecorder{}
-	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(decider).SetFromPre(true)
-	cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
-
-	_, err := captureReport(t, cmd)
-
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{
-		"jfrog/curate@v1":     {SHA: testShaSelf, BySHA: true},
-		"actions/checkout@v4": {SHA: testShaV4, BySHA: true},
-	}, factsOf(decider.refs))
-}
-
-func TestCurationActionsCommand_Run_HookModeWithoutARunnerDirFails(t *testing.T) {
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
-	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetCallerMode(githubactions.ModeHook, "").SetDecider(&scriptedDecider{})
-	_, err := captureReport(t, cmd)
-	assert.ErrorContains(t, err, "runner directory")
-}
-
-func TestCurationActionsCommand_Run_FromPreWithoutAFinderComparesByContent(t *testing.T) {
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
-	t.Setenv(stepSummaryEnvVar, "")
-	_, cacheDir := runnerSpec{cacheDirs: []string{"actions/checkout/v4"}}.build(t)
-	decider := &refRecorder{}
-	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(decider).SetFromPre(true)
-	cmd.runnerDirFinder = nil
-	_, err := captureReport(t, cmd)
-	require.NoError(t, err)
-	assert.Equal(t, map[string]refFacts{"actions/checkout@v4": {Reason: githubactions.ReasonNoSHA}}, factsOf(decider.refs))
+			require.NoError(t, err)
+			assert.Len(t, decider.refs, len(tt.wantRefs), "refs decided")
+			assert.Equal(t, tt.wantRefs, factsOf(decider.refs))
+			assert.Equal(t, tt.wantParent, strings.Contains(report, "| Parent |"), "Run() report:\n%s", report)
+			for _, s := range tt.wantInReport {
+				assert.Contains(t, report, s)
+			}
+			content, err := os.ReadFile(summary)
+			require.NoError(t, err)
+			if tt.wantSummaryAppended {
+				assert.True(t, strings.HasPrefix(string(content), "earlier hook\n"), "the summary must be appended, not replace what is there")
+				assert.Contains(t, string(content), "| actions/checkout | v4 |")
+			} else {
+				assert.Equal(t, "earlier hook\n", string(content))
+			}
+		})
+	}
 }

@@ -262,6 +262,49 @@ func TestCurationActionsCommand_Run_CurationScope(t *testing.T) {
 			jobID:     "the-job-this-command-runs-in",
 			wantAsked: []string{"actions/checkout@v4", "actions/setup-node@v4"},
 		},
+		{
+			// uses: ./... is read from the workspace, so there is nothing to walk outward from - the
+			// entry is unattributable, and must still be curated. This covers the case where the runner
+			// had already resolved the child by the time this command ran; the case where it has not is
+			// the "job declares a local composite action" row of the coverage caveat table.
+			name: "verify when a local composite action's child is already in the cache then it is still decided",
+			spec: runnerSpec{
+				cacheDirs:    []string{"actions/setup-node/v4"},
+				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/setup\n",
+			},
+			mode:      writtenWorkflowFile,
+			jobID:     "build",
+			wantAsked: []string{"actions/setup-node@v4"},
+		},
+		{
+			// Duplicate mapping keys: accepted by GitHub's runner, rejected by yaml.v3.
+			name: "verify when a composite action.yml cannot be parsed then its child is still decided",
+			spec: runnerSpec{
+				cacheDirs: []string{"actions/setup-node/v4", "some-org/wrapper/v1"},
+				cacheFiles: map[string]string{
+					"some-org/wrapper/v1/action.yml": "name: w\nname: w\nruns:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n",
+				},
+				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: some-org/wrapper@v1\n",
+			},
+			mode:      writtenWorkflowFile,
+			jobID:     "build",
+			wantAsked: []string{"actions/setup-node@v4", "some-org/wrapper@v1"},
+		},
+		{
+			// The delivery action is a parent like any other, and is curated like any other rather than
+			// being filtered out of the table after attribution has already pointed at it.
+			name: "verify when the action delivering this check pulls in another action then both are decided",
+			spec: runnerSpec{
+				cacheDirs: []string{"jfrog/setup-jfrog-cli/v4", "some-org/pulled-by-delivery/v1"},
+				cacheFiles: map[string]string{
+					"jfrog/setup-jfrog-cli/v4/action.yml": "runs:\n  using: composite\n  steps:\n    - uses: some-org/pulled-by-delivery@v1\n",
+				},
+				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: jfrog/setup-jfrog-cli@v4\n",
+			},
+			mode:      writtenWorkflowFile,
+			jobID:     "build",
+			wantAsked: []string{"jfrog/setup-jfrog-cli@v4", "some-org/pulled-by-delivery@v1"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -276,31 +319,45 @@ func TestCurationActionsCommand_Run_CurationScope(t *testing.T) {
 	}
 }
 
-func TestCurationActionsCommand_Run_ExitStatus(t *testing.T) {
-	// The job either continues or it does not. A Rejected action must fail it, whether or not
-	// attribution could explain why that action is in the cache.
+func TestCurationActionsCommand_Run_Gate(t *testing.T) {
+	// The job continues only when every action is explicitly Approved. Rejected and Undetermined each
+	// fail it, are each reported as their own row, and the error names what failed and why.
+	twoActions := runnerSpec{cacheDirs: []string{"actions/checkout/v4", "actions/setup-node/v4"}}
+
 	tests := []struct {
-		name     string
-		spec     runnerSpec
-		mode     workflowFileMode
-		jobID    string
-		rejected []string
-		wantErr  bool
+		name  string
+		spec  runnerSpec
+		mode  workflowFileMode
+		jobID string
+		// rejected, undecidable and silentlyUndetermined script the decider, keyed "owner/repo@ref".
+		rejected             []string
+		undecidable          []string
+		silentlyUndetermined []string
+		wantErr              bool
+		wantErrContains      []string // each must appear in the error
+		wantErrNotContains   []string // none may appear in the error
+		// wantNoVerdict: the run stops before deciding anything - nothing asked, no report, no summary.
+		wantNoVerdict bool
+		// wantRows is the report's row count per status; a status left out must have no row.
+		wantRows map[githubactions.ActionCurationStatus]int
 	}{
 		{
 			// SetJobID is what puts this in ATTRIBUTED mode - a workflow file alone is not enough,
 			// since attribution also needs to know which job it is describing.
-			name:  "verify when every action is approved then the command succeeds",
-			spec:  runnerSpec{fixtureCache: true},
-			mode:  fixtureWorkflowFile,
-			jobID: "build",
-		},
-		{
-			name:     "verify when an action is rejected then the command fails",
+			name:     "verify when every action is approved then the command succeeds",
 			spec:     runnerSpec{fixtureCache: true},
 			mode:     fixtureWorkflowFile,
-			rejected: []string{"some-org/transitive-action@v1"},
-			wantErr:  true,
+			jobID:    "build",
+			wantRows: map[githubactions.ActionCurationStatus]int{githubactions.ActionApproved: 3},
+		},
+		{
+			name:            "verify when an action is rejected then the command fails and the error names it",
+			spec:            runnerSpec{fixtureCache: true},
+			mode:            fixtureWorkflowFile,
+			rejected:        []string{"some-org/transitive-action@v1"},
+			wantErr:         true,
+			wantErrContains: []string{`"some-org/transitive-action@v1": status "Rejected"`},
+			wantRows:        map[githubactions.ActionCurationStatus]int{githubactions.ActionApproved: 2, githubactions.ActionRejected: 1},
 		},
 		{
 			// It will execute, so failing to explain why it is there is no grounds for skipping it.
@@ -310,15 +367,7 @@ func TestCurationActionsCommand_Run_ExitStatus(t *testing.T) {
 			jobID:    "build",
 			rejected: []string{"some-other-org/unexplained-action@v9"},
 			wantErr:  true,
-		},
-		{
-			// Not "nothing to curate": the command is invoked by an action, which is itself a cache
-			// entry, so an empty cache means the wrong directory was read. Passing off it would be
-			// indistinguishable from a real pass.
-			name:    "verify when the cache is empty then the command fails rather than reporting a pass",
-			spec:    runnerSpec{},
-			mode:    fixtureWorkflowFile,
-			wantErr: true,
+			wantRows: map[githubactions.ActionCurationStatus]int{githubactions.ActionApproved: 3, githubactions.ActionRejected: 1},
 		},
 		{
 			// No action is rejected here: the cache holds an entry the walk cannot resolve to an
@@ -330,8 +379,9 @@ func TestCurationActionsCommand_Run_ExitStatus(t *testing.T) {
 				// Written through cacheFiles so the directory exists with no watermark beside it.
 				cacheFiles: map[string]string{"actions/checkout/feature/my-branch/action.yml": "runs:\n  using: node20\n"},
 			},
-			mode:    noWorkflowFile,
-			wantErr: true,
+			mode:          noWorkflowFile,
+			wantErr:       true,
+			wantNoVerdict: true,
 		},
 		{
 			// Dropping the unattributable entry once turned a Rejected action into a green build.
@@ -344,56 +394,47 @@ func TestCurationActionsCommand_Run_ExitStatus(t *testing.T) {
 			jobID:    "build",
 			rejected: []string{"evil-org/backdoor@v1"},
 			wantErr:  true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pinRunnerEnv(t, testGithubRepo, "", "")
-			decider := &scriptedDecider{rejected: tt.rejected}
-
-			err := tt.spec.newCommand(t, tt.mode, tt.jobID, decider).Run()
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				return
-			}
-			assert.NoError(t, err)
-		})
-	}
-}
-
-func TestCurationActionsCommand_Run_UndecidableActions(t *testing.T) {
-	twoActions := runnerSpec{cacheDirs: []string{"actions/checkout/v4", "actions/setup-node/v4"}}
-
-	tests := []struct {
-		name               string
-		spec               runnerSpec
-		mode               workflowFileMode
-		undecidable        []string
-		wantErrContains    []string
-		wantErrNotContains []string
-		wantApprovedRows   int
-	}{
-		{
-			name:            "verify when a decision fails then the error names the action and the cause",
-			spec:            runnerSpec{fixtureCache: true},
-			mode:            fixtureWorkflowFile,
-			undecidable:     fixtureCacheEntries,
-			wantErrContains: []string{"deciding curation status for", "decision service unavailable"},
+			wantRows: map[githubactions.ActionCurationStatus]int{githubactions.ActionRejected: 1},
 		},
 		{
-			name:            "verify when several decisions fail then the error names every one of them",
-			spec:            twoActions,
-			undecidable:     []string{"actions/checkout@v4", "actions/setup-node@v4"},
-			wantErrContains: []string{"actions/checkout@v4", "actions/setup-node@v4"},
+			name:        "verify when every decision fails then the error names each action and the cause",
+			spec:        twoActions,
+			undecidable: []string{"actions/checkout@v4", "actions/setup-node@v4"},
+			wantErr:     true,
+			wantErrContains: []string{"deciding curation status for", "actions/checkout@v4", "actions/setup-node@v4",
+				"decision service unavailable"},
+			wantRows: map[githubactions.ActionCurationStatus]int{githubactions.ActionUndetermined: 2},
 		},
 		{
 			name:               "verify when only one decision fails then the error names it alone and the other is still reported",
 			spec:               twoActions,
 			undecidable:        []string{"actions/setup-node@v4"},
+			wantErr:            true,
 			wantErrContains:    []string{"actions/setup-node@v4"},
 			wantErrNotContains: []string{"actions/checkout@v4"},
-			wantApprovedRows:   1,
+			wantRows:           map[githubactions.ActionCurationStatus]int{githubactions.ActionApproved: 1, githubactions.ActionUndetermined: 1},
+		},
+		{
+			name:        "verify when actions are approved, rejected and undecidable then each is its own row and the error names both failures",
+			spec:        runnerSpec{cacheDirs: []string{"actions/checkout/v4", "evil-org/backdoor/v1", "flaky-org/remote/v1"}},
+			rejected:    []string{"evil-org/backdoor@v1"},
+			undecidable: []string{"flaky-org/remote@v1"},
+			wantErr:     true,
+			wantErrContains: []string{`"evil-org/backdoor@v1": status "Rejected"`, "flaky-org/remote@v1",
+				"decision service unavailable"},
+			// An Undetermined action is explained once, by its cause.
+			wantErrNotContains: []string{`status "Undetermined"`},
+			wantRows: map[githubactions.ActionCurationStatus]int{
+				githubactions.ActionApproved: 1, githubactions.ActionRejected: 1, githubactions.ActionUndetermined: 1},
+		},
+		{
+			// Only an explicit Approved may clear the gate.
+			name:                 "verify when a decider returns Undetermined without an error then the command still fails",
+			spec:                 runnerSpec{cacheDirs: []string{"actions/checkout/v4", "quiet-org/action/v1"}},
+			silentlyUndetermined: []string{"quiet-org/action@v1"},
+			wantErr:              true,
+			wantErrContains:      []string{`"quiet-org/action@v1": status "Undetermined"`},
+			wantRows:             map[githubactions.ActionCurationStatus]int{githubactions.ActionApproved: 1, githubactions.ActionUndetermined: 1},
 		},
 	}
 	for _, tt := range tests {
@@ -402,51 +443,32 @@ func TestCurationActionsCommand_Run_UndecidableActions(t *testing.T) {
 			// Recording is a no-op unless this is set.
 			summaryDir := t.TempDir()
 			t.Setenv(coreutils.SummaryOutputDirPathEnv, summaryDir)
-			decider := &scriptedDecider{undecidable: tt.undecidable}
+			decider := &scriptedDecider{rejected: tt.rejected, undecidable: tt.undecidable, silentlyUndetermined: tt.silentlyUndetermined}
 
-			report, err := captureReport(t, tt.spec.newCommand(t, tt.mode, "", decider))
+			report, err := captureReport(t, tt.spec.newCommand(t, tt.mode, tt.jobID, decider))
 
-			require.Error(t, err)
+			assert.Equal(t, tt.wantErr, err != nil, "Run() error = %v", err)
 			for _, want := range tt.wantErrContains {
 				assert.ErrorContains(t, err, want)
 			}
 			for _, notWant := range tt.wantErrNotContains {
-				assert.NotContains(t, err.Error(), notWant)
+				assert.NotContains(t, fmt.Sprint(err), notWant)
 			}
-			assert.Equal(t, len(tt.undecidable), strings.Count(report, "| Undetermined |"),
-				"every undecidable action must be a row, not omitted:\n%s", report)
-			assert.Equal(t, tt.wantApprovedRows, strings.Count(report, "| Approved |"),
-				"the actions that were decided must still be reported:\n%s", report)
-			assert.Contains(t, report, "decision service unavailable", "an Undetermined row must carry its cause")
 			entries, readErr := os.ReadDir(summaryDir)
 			require.NoError(t, readErr)
-			assert.NotEmpty(t, entries, "the job summary must be recorded even when an action could not be decided")
-		})
-	}
-}
-
-func TestCurationActionsCommand_Run_AttributedAndStructureOnlyCurateTheSameSet(t *testing.T) {
-	// The two modes differ in report detail, never in coverage. Same cache, same job: both must
-	// decide every entry, including one no workflow references.
-	spec := runnerSpec{fixtureCache: true, cacheDirs: []string{"some-org/unreferenced/v9"}}
-	wantAsked := append(slices.Clone(fixtureCacheEntries), "some-org/unreferenced@v9")
-
-	tests := []struct {
-		name  string
-		mode  workflowFileMode
-		jobID string
-	}{
-		{name: "verify when a workflow file is supplied then every cache entry is decided", mode: fixtureWorkflowFile, jobID: "build"},
-		{name: "verify when no workflow file is supplied then the same entries are decided", mode: noWorkflowFile},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pinRunnerEnv(t, testGithubRepo, "", "")
-			decider := &scriptedDecider{}
-
-			require.NoError(t, spec.newCommand(t, tt.mode, tt.jobID, decider).Run())
-
-			assert.ElementsMatch(t, wantAsked, decider.asked)
+			if tt.wantNoVerdict {
+				assert.Empty(t, decider.asked, "nothing may be decided when the cache cannot be accounted for")
+				assert.NotContains(t, report, "GitHub Actions Curation Report")
+				assert.Empty(t, entries)
+				return
+			}
+			for _, status := range []githubactions.ActionCurationStatus{githubactions.ActionApproved, githubactions.ActionRejected, githubactions.ActionUndetermined} {
+				assert.Equal(t, tt.wantRows[status], strings.Count(report, "| "+string(status)+" |"), "%s rows in:\n%s", status, report)
+			}
+			if len(tt.undecidable) > 0 {
+				assert.Contains(t, report, "decision service unavailable", "an Undetermined row must carry its cause")
+			}
+			assert.NotEmpty(t, entries, "the job summary is recorded whatever the verdict")
 		})
 	}
 }
@@ -509,9 +531,22 @@ func TestCurationActionsCommand_Run_WorkflowFileResolution(t *testing.T) {
 			workflowRef: derivedWorkflowRef,
 			wantAsked:   []string{"actions/checkout@v4"},
 		},
+		{
+			// The path resolves and opening it still fails - a permission error rather than an absent
+			// file. It reaches the command as neither ErrNotExist nor a parse error, which is the one
+			// route that used to abort the run; curation is the job, so it degrades like the rest.
+			name: "verify when the derived workflow file is unreadable then curation falls back to structure-only",
+			spec: runnerSpec{cacheDirs: oneAction, workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n",
+				unreadableWorkflow: true},
+			workflowRef: derivedWorkflowRef,
+			wantAsked:   []string{"actions/checkout@v4"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.spec.unreadableWorkflow && (runtime.GOOS == "windows" || os.Geteuid() == 0) {
+				t.Skip("file permissions cannot deny the read here (Windows only toggles read-only; root ignores modes)")
+			}
 			pinRunnerEnv(t, testGithubRepo, tt.workflowRef, "build")
 			decider := &scriptedDecider{}
 
@@ -611,50 +646,6 @@ func TestCurationActionsCommand_Run_EmptyCacheFailsBeforeResolving(t *testing.T)
 	assert.Empty(t, resolver.askedAbout, "a cache that cannot be read must fail before any mapping call")
 }
 
-func TestCurationActionsCommand_Run_ActionsAttributionCannotExplainAreStillCurated(t *testing.T) {
-	// The two ways the runner's cache can hold an entry this command cannot trace back to a
-	// uses: line. Both once caused the entry to be dropped, so the job passed with an action
-	// that executes having never been decided.
-	tests := []struct {
-		name string
-		spec runnerSpec
-	}{
-		{
-			name: "verify when a local composite action's child is already in the cache then it is still decided",
-			// uses: ./... is read from the workspace, so there is nothing to walk outward from -
-			// the entry is unattributable, and must still be curated. This covers only the case
-			// where the runner had already resolved the child by the time this command ran; the
-			// case where it has not is TestCurationActionsCommand_Run_LocalCompositeActionIsDeclaredUncovered.
-			spec: runnerSpec{
-				cacheDirs:    []string{"actions/setup-node/v4"},
-				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/setup\n",
-			},
-		},
-		{
-			name: "verify when a composite action.yml cannot be parsed then its child is still decided",
-			// Duplicate mapping keys: accepted by GitHub's runner, rejected by yaml.v3.
-			spec: runnerSpec{
-				cacheDirs: []string{"actions/setup-node/v4", "some-org/wrapper/v1"},
-				cacheFiles: map[string]string{
-					"some-org/wrapper/v1/action.yml": "name: w\nname: w\nruns:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n",
-				},
-				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: some-org/wrapper@v1\n",
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pinRunnerEnv(t, testGithubRepo, "", "")
-			decider := &scriptedDecider{}
-
-			require.NoError(t, tt.spec.newCommand(t, writtenWorkflowFile, "build", decider).Run())
-
-			assert.Contains(t, decider.asked, "actions/setup-node@v4",
-				"an action the runner resolved will execute, so it must be decided even when it cannot be attributed")
-		})
-	}
-}
-
 // captureReport runs cmd with the logger redirected, and returns everything it wrote. The
 // report and its caveat only exist as log output, so that is where a test has to read them.
 func captureReport(t *testing.T, cmd *CurationActionsCommand) (report string, err error) {
@@ -665,57 +656,6 @@ func captureReport(t *testing.T, cmd *CurationActionsCommand) (report string, er
 	defer log.SetLogger(original)
 	err = cmd.Run()
 	return buf.String(), err
-}
-
-func TestCurationActionsCommand_Run_LocalCompositeActionIsDeclaredUncovered(t *testing.T) {
-	// The gap this caveat exists for, in the shape that actually bites: the job declares a local
-	// composite action, and the action it pulls in is NOT in the cache, because the runner cannot
-	// resolve a local action's own references until the workspace is checked out - it downloads
-	// them when that step runs, after this command has read the cache.
-	//
-	// Nothing here can be decided, so the command is right to pass. What it must not do is let an
-	// all-Approved table stand as the whole account of what the job will execute.
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	decider := &scriptedDecider{}
-	spec := runnerSpec{
-		cacheDirs: []string{"actions/checkout/v4"},
-		workflowYAML: "jobs:\n  build:\n    steps:\n" +
-			"      - uses: actions/checkout@v4\n" +
-			"      - uses: ./.github/actions/setup\n",
-	}
-
-	report, err := captureReport(t, spec.newCommand(t, writtenWorkflowFile, "build", decider))
-
-	require.NoError(t, err, "nothing was rejected, so the gate is right to open - the caveat is what keeps that honest")
-	assert.Equal(t, []string{"actions/checkout@v4"}, decider.asked,
-		"the local action's own references are not in the cache yet, so there is nothing more to decide")
-	assert.Contains(t, report, "./.github/actions/setup",
-		"the report must name the local step whose references it never saw")
-	assert.Contains(t, report, "not curated here")
-}
-
-func TestCurationActionsCommand_Run_LocalStepInsideACompositeActionIsDeclaredUncovered(t *testing.T) {
-	// One level down from the workflow: a third-party composite action in the cache declares
-	// "uses: ./...". That path resolves against this repository's checkout, not the action's own
-	// directory, so the runner fetches whatever it references when the step runs - after this
-	// command read the cache. The composite itself is curated; what it reaches that way is not.
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	decider := &scriptedDecider{}
-	spec := runnerSpec{
-		cacheDirs: []string{"some-org/wrapper/v1"},
-		cacheFiles: map[string]string{
-			"some-org/wrapper/v1/action.yml": "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/build\n",
-		},
-		workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: some-org/wrapper@v1\n",
-	}
-
-	report, err := captureReport(t, spec.newCommand(t, writtenWorkflowFile, "build", decider))
-
-	require.NoError(t, err)
-	assert.Equal(t, []string{"some-org/wrapper@v1"}, decider.asked, "the composite action itself is still curated")
-	assert.Contains(t, report, "./.github/actions/build")
-	assert.Contains(t, report, "declared by some-org/wrapper@v1",
-		"the path names a directory in this repository, so the report has to say which action reached it")
 }
 
 func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T) {
@@ -799,6 +739,20 @@ func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T
 			jobID:           "build",
 			wantNotContains: []string{"Not covered", "./.github/actions/release"},
 		},
+		{
+			// The gap this caveat exists for: the job declares a local composite action, and the action
+			// it pulls in is not in the cache, because the runner cannot resolve a local action's own
+			// references until the workspace is checked out. Nothing can be decided, so the command is
+			// right to pass; the report must not let an all-Approved table stand as the whole account.
+			name: "verify when the job declares a local composite action then the caveat names it",
+			spec: runnerSpec{
+				cacheDirs:    []string{"actions/checkout/v4"},
+				workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n      - uses: ./.github/actions/setup\n",
+			},
+			mode:         writtenWorkflowFile,
+			jobID:        "build",
+			wantContains: []string{"./.github/actions/setup", "not curated here"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -815,59 +769,6 @@ func TestCurationActionsCommand_Run_CoverageCaveatPerResolutionPath(t *testing.T
 			}
 		})
 	}
-}
-
-func TestCurationActionsCommand_Run_EveryParentNamesARowInTheTable(t *testing.T) {
-	// Parent is a cross-reference into the report's own rows, so a row it names has to be there.
-	// The action delivering this check is the one that could break that: it is a parent like any
-	// other, and it is curated like any other rather than being filtered out of the table after
-	// attribution has already pointed at it.
-	pinRunnerEnv(t, testGithubRepo, "", "")
-	decider := &scriptedDecider{}
-	spec := runnerSpec{
-		cacheDirs: []string{"jfrog/setup-jfrog-cli/v4", "some-org/pulled-by-delivery/v1"},
-		cacheFiles: map[string]string{
-			"jfrog/setup-jfrog-cli/v4/action.yml": "runs:\n  using: composite\n  steps:\n    - uses: some-org/pulled-by-delivery@v1\n",
-		},
-		workflowYAML: "jobs:\n  build:\n    steps:\n      - uses: jfrog/setup-jfrog-cli@v4\n",
-	}
-
-	report, err := captureReport(t, spec.newCommand(t, writtenWorkflowFile, "build", decider))
-
-	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"jfrog/setup-jfrog-cli@v4", "some-org/pulled-by-delivery@v1"}, decider.asked,
-		"no action is exempt from the gate, including the one that installed this CLI")
-	// The child names its parent, and that parent has a row of its own above it.
-	assert.Contains(t, report, "| some-org/pulled-by-delivery | v1 | jfrog/setup-jfrog-cli@v4 |")
-	assert.Contains(t, report, "| jfrog/setup-jfrog-cli | v4 |")
-}
-
-func TestCurationActionsCommand_Run_UnreadableWorkflowFileFallsBackRatherThanFailing(t *testing.T) {
-	// The path resolves and opening it still fails - a permission error rather than an absent
-	// file. It reaches the command as neither ErrNotExist nor a parse error, which is the one
-	// route that used to abort the run. Curation is the job, so it degrades like every other
-	// workflow-file problem.
-	if runtime.GOOS == "windows" {
-		t.Skip("os.Chmod on Windows only toggles the read-only attribute, so reads are not denied and the failure cannot be produced")
-	}
-	if os.Geteuid() == 0 {
-		t.Skip("running as root: file permissions do not deny access, so the failure cannot be produced")
-	}
-	pinRunnerEnv(t, testGithubRepo, derivedWorkflowRef, "")
-	decider := &scriptedDecider{}
-	spec := runnerSpec{
-		cacheDirs:          []string{"actions/checkout/v4"},
-		workflowYAML:       "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n",
-		unreadableWorkflow: true,
-	}
-
-	report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "build", decider))
-
-	require.NoError(t, err, "a job gated on this command must not fail because the workflow file could not be opened")
-	assert.Equal(t, []string{"actions/checkout@v4"}, decider.asked, "the cache is curated in full regardless")
-	// Attribution is gone, and the report says so rather than passing silently.
-	assert.NotContains(t, report, "| Action | Ref | Parent |", "a run with no attribution must not render a Parent column")
-	assert.Contains(t, report, "Local composite actions (uses: ./...) are not curated")
 }
 
 func TestCurationActionsCommand_Run_ErrorHandlingHookAppliesToFailuresNotOutcomes(t *testing.T) {
@@ -1042,52 +943,52 @@ func orderedActions(n int) (runnerSpec, []string) {
 }
 
 func TestCurationActionsCommand_Run_StopsOnAccessFailure(t *testing.T) {
-	t.Run("verify when one action is refused access with a single thread then no later action is decided and nothing is reported", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		summaryDir := t.TempDir()
-		t.Setenv(coreutils.SummaryOutputDirPathEnv, summaryDir)
-		spec, keys := orderedActions(5)
-		decider := &probeDecider{denied: []string{keys[1]}} // the 2nd of 5 in discovery order
+	tests := []struct {
+		name    string
+		actions int // size of the orderedActions cache: a-org/act@v1, b-org/act@v1, ...
+		threads int
+		// denied actions fail with ErrAccessDenied; "*" denies every action. rejected are Rejected.
+		denied   []string
+		rejected []string
+		// wantAccessErr: the run stops on the access failure; otherwise every action is decided.
+		wantAccessErr bool
+		wantMaxCalls  int32 // upper bound on decisions made when the run stops
+	}{
+		{name: "verify when one action is refused access with a single thread then no later action is decided and nothing is reported",
+			actions: 5, threads: 1, denied: []string{"b-org/act@v1"}, wantAccessErr: true, wantMaxCalls: 2},
+		{name: "verify when access is refused with several threads then the run stops well short of every action",
+			// Up to threads decisions are in flight when the first refusal lands, and each other worker
+			// may begin one more before it sees the stop; 20 would mean nothing stopped.
+			actions: 20, threads: 3, denied: []string{"*"}, wantAccessErr: true, wantMaxCalls: 6},
+		{name: "verify when an action is rejected then the run does not stop and every action is decided",
+			actions: 5, threads: 1, rejected: []string{"b-org/act@v1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, "", "")
+			summaryDir := t.TempDir()
+			t.Setenv(coreutils.SummaryOutputDirPathEnv, summaryDir)
+			spec, _ := orderedActions(tt.actions)
+			decider := &probeDecider{denied: tt.denied, rejected: tt.rejected}
 
-		report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(1))
+			report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(tt.threads))
 
-		require.Error(t, err)
-		assert.True(t, errors.Is(err, githubactions.ErrAccessDenied), "Run() error = %v, want ErrAccessDenied", err)
-		assert.LessOrEqual(t, decider.calls.Load(), int32(2), "no action after the refused one may be decided")
-		assert.NotContains(t, report, "GitHub Actions Curation Report", "a run stopped part-way must not report")
-		entries, readErr := os.ReadDir(summaryDir)
-		require.NoError(t, readErr)
-		assert.Empty(t, entries, "a run stopped part-way must not record a job summary")
-	})
-	t.Run("verify when access is refused with several threads then the run stops well short of every action", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		const threads = 3
-		spec, _ := orderedActions(20)
-		decider := &probeDecider{denied: []string{"*"}}
-
-		err := spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(threads).Run()
-
-		require.Error(t, err)
-		assert.True(t, errors.Is(err, githubactions.ErrAccessDenied), "Run() error = %v, want ErrAccessDenied", err)
-		// Up to threads decisions are in flight when the first refusal lands, and each other worker
-		// may begin at most one more before it sees the stop; 20 would mean nothing stopped.
-		assert.LessOrEqual(t, decider.calls.Load(), int32(2*threads), "the run did not stop on the access failure")
-		assert.Equal(t, 1, strings.Count(err.Error(), githubactions.ErrAccessDenied.Error()),
-			"one access failure is reported, not one per action: %v", err)
-	})
-	t.Run("verify when an action is rejected then the run does not stop and every action is decided", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		spec, keys := orderedActions(5)
-		decider := &probeDecider{rejected: []string{keys[1]}}
-
-		report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(1))
-
-		require.Error(t, err)
-		assert.False(t, errors.Is(err, githubactions.ErrAccessDenied), "a curation block must not stop the run: %v", err)
-		assert.Equal(t, int32(5), decider.calls.Load(), "every action must be decided after a rejection")
-		assert.Equal(t, 4, strings.Count(report, "| Approved |"))
-		assert.Equal(t, 1, strings.Count(report, "| Rejected |"))
-	})
+			require.Error(t, err)
+			assert.Equal(t, tt.wantAccessErr, errors.Is(err, githubactions.ErrAccessDenied), "Run() error = %v", err)
+			if tt.wantAccessErr {
+				assert.LessOrEqual(t, decider.calls.Load(), tt.wantMaxCalls, "the run did not stop on the access failure")
+				assert.Equal(t, 1, strings.Count(err.Error(), githubactions.ErrAccessDenied.Error()), "one access failure is reported, not one per action: %v", err)
+				assert.NotContains(t, report, "GitHub Actions Curation Report", "a run stopped part-way must not report")
+				entries, readErr := os.ReadDir(summaryDir)
+				require.NoError(t, readErr)
+				assert.Empty(t, entries, "a run stopped part-way must not record a job summary")
+				return
+			}
+			assert.Equal(t, int32(tt.actions), decider.calls.Load(), "every action must be decided after a rejection")
+			assert.Equal(t, len(tt.rejected), strings.Count(report, "| Rejected |"))
+			assert.Equal(t, tt.actions-len(tt.rejected), strings.Count(report, "| Approved |"))
+		})
+	}
 }
 
 func TestCurationActionsCommand_Run_ParallelDecisions(t *testing.T) {
@@ -1115,55 +1016,23 @@ func TestCurationActionsCommand_Run_ParallelDecisions(t *testing.T) {
 }
 
 func TestCurationActionsCommand_Run_ReportOrderIsDiscoveryOrder(t *testing.T) {
-	t.Run("verify when decisions finish in reverse then the report still lists actions in discovery order", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		spec, _ := orderedActions(5)
-		// The first action is the slowest, so with every action in flight at once they finish last-first.
-		decider := &probeDecider{hold: func(ref githubactions.ActionRef) time.Duration {
-			return time.Duration('f'-rune(ref.Owner[0])) * 15 * time.Millisecond
-		}}
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	spec, _ := orderedActions(5)
+	// The first action is the slowest, so with every action in flight at once they finish last-first.
+	decider := &probeDecider{hold: func(ref githubactions.ActionRef) time.Duration {
+		return time.Duration('f'-rune(ref.Owner[0])) * 15 * time.Millisecond
+	}}
 
-		report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(5))
+	report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider).SetParallelRequests(5))
 
-		require.NoError(t, err)
-		last := -1
-		for _, owner := range []string{"a-org", "b-org", "c-org", "d-org", "e-org"} {
-			idx := strings.Index(report, "| "+owner+"/act |")
-			require.GreaterOrEqual(t, idx, 0, "%s missing from the report:\n%s", owner, report)
-			assert.Greater(t, idx, last, "%s is out of discovery order:\n%s", owner, report)
-			last = idx
-		}
-	})
-}
-
-func TestCurationActionsCommand_Run_MixedOutcomes(t *testing.T) {
-	t.Run("verify when actions are approved, rejected and undecidable then each is its own row and the error names both failures", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		spec := runnerSpec{cacheDirs: []string{"actions/checkout/v4", "evil-org/backdoor/v1", "flaky-org/remote/v1"}}
-		decider := &scriptedDecider{rejected: []string{"evil-org/backdoor@v1"}, undecidable: []string{"flaky-org/remote@v1"}}
-
-		report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider))
-
-		require.Error(t, err)
-		assert.Equal(t, 1, strings.Count(report, "| Approved |"), report)
-		assert.Equal(t, 1, strings.Count(report, "| Rejected |"), report)
-		assert.Equal(t, 1, strings.Count(report, "| Undetermined |"), report)
-		assert.ErrorContains(t, err, `"evil-org/backdoor@v1": status "Rejected"`)
-		assert.ErrorContains(t, err, "flaky-org/remote@v1")
-		assert.ErrorContains(t, err, "decision service unavailable")
-		assert.NotContains(t, err.Error(), `status "Undetermined"`, "an Undetermined action is explained once, by its cause")
-	})
-	t.Run("verify when a decider returns Undetermined without an error then the command still fails", func(t *testing.T) {
-		pinRunnerEnv(t, testGithubRepo, "", "")
-		spec := runnerSpec{cacheDirs: []string{"actions/checkout/v4", "quiet-org/action/v1"}}
-		decider := &scriptedDecider{silentlyUndetermined: []string{"quiet-org/action@v1"}}
-
-		report, err := captureReport(t, spec.newCommand(t, noWorkflowFile, "", decider))
-
-		require.Error(t, err, "only an explicit Approved may clear the gate")
-		assert.Equal(t, 1, strings.Count(report, "| Undetermined |"), report)
-		assert.ErrorContains(t, err, `"quiet-org/action@v1": status "Undetermined"`)
-	})
+	require.NoError(t, err)
+	last := -1
+	for _, owner := range []string{"a-org", "b-org", "c-org", "d-org", "e-org"} {
+		idx := strings.Index(report, "| "+owner+"/act |")
+		require.GreaterOrEqual(t, idx, 0, "%s missing from the report:\n%s", owner, report)
+		assert.Greater(t, idx, last, "%s is out of discovery order:\n%s", owner, report)
+		last = idx
+	}
 }
 
 func TestCurationActionsCommand_Run_RequiresAServerWithoutATestDecider(t *testing.T) {
@@ -1278,9 +1147,8 @@ func TestCurationActionsCommand_Run_ContentMismatchIsReportedAndFailsTheGate(t *
 
 	const mismatch = "not able to decide since content is mismatched (action.yml differs)"
 	assert.ElementsMatch(t, slices.Collect(maps.Keys(served)), requested, "every action must be decided")
-	assert.Contains(t, report, "| acme/one | "+shaOne+" | Approved |  |")
-	assert.Contains(t, report, "| acme/two | "+shaTwo+" | Rejected | "+mismatch+" |")
-	assert.Contains(t, report, "| acme/three | "+shaThree+" | Approved |  |")
+	assert.Equal(t, 2, strings.Count(report, "| Approved |"), report)
+	assert.Equal(t, 1, strings.Count(report, "| Rejected |"), report)
 	require.Error(t, err, "a content mismatch must fail the gate")
 	assert.ErrorContains(t, err, "acme/two@"+shaTwo)
 	assert.ErrorContains(t, err, mismatch)
@@ -1340,4 +1208,236 @@ func TestNotApprovedErrorQuotesWhatItRepeats(t *testing.T) {
 	assert.NotContains(t, err.Error(), "\n::error::")
 	assert.NotContains(t, err.Error(), "\r")
 	assert.Contains(t, err.Error(), `"evil/x::error::a@v1::error::b": status "Rejected" - "n::error::c"`)
+}
+
+func folderExists(t *testing.T, path string) bool {
+	t.Helper()
+	_, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	require.NoError(t, err)
+	return true
+}
+
+func TestCurationActionsCommand_Run_NeutralizesWhatIsNotApproved(t *testing.T) {
+	tests := []struct {
+		name string
+		// hook runs Run as the job-started hook over trustedHookJob's runner; false runs it as a plain step
+		// over a runnerSpec cache. Both hold actions/checkout/v4 and actions/setup-node/v4, unless diag
+		// sets another layout.
+		hook     bool
+		rejected []string // keys the scriptedDecider rejects
+		denied   bool     // a probeDecider refuses access to every action instead
+		vcsErr   bool     // the VCS repository resolver fails, so no verdict is reached
+		// diag and cacheDirs, when diag is set, replace trustedHookJob's layout (hookRunner's arguments).
+		diag      map[string]string
+		cacheDirs []string
+		// unmarked is a cache-relative action folder created holding an action.yml and no watermark, so
+		// the walk cannot tell its ref and discovery cannot account for it.
+		unmarked        string
+		wantErrContains string
+		wantRemoved     []string // cache-relative paths gone after Run
+		wantKept        []string // cache-relative paths still there ("." is the cache itself)
+		// wantRemovedWarning are the quoted names the single "Removed ..." warning must list; nil: no warning.
+		wantRemovedWarning []string
+	}{
+		{
+			name:            "verify when the hook rejects an action then its folder is removed and an approved one is kept",
+			hook:            true,
+			rejected:        []string{"actions/setup-node@v4"},
+			wantErrContains: "actions/setup-node@v4",
+			wantRemoved:     []string{"actions/setup-node/v4", "actions/setup-node/v4.completed"},
+			// The repository folder itself stays.
+			wantKept:           []string{"actions/setup-node", "actions/checkout/v4", "actions/checkout/v4.completed"},
+			wantRemovedWarning: []string{`"actions/setup-node@v4"`},
+		},
+		{
+			name:               "verify when access is refused in the hook then every folder is removed",
+			hook:               true,
+			denied:             true,
+			wantErrContains:    githubactions.ErrAccessDenied.Error(),
+			wantRemoved:        []string{"actions/checkout/v4", "actions/setup-node/v4"},
+			wantRemovedWarning: []string{`"actions/checkout@v4"`, `"actions/setup-node@v4"`},
+		},
+		{
+			name:               "verify when the hook cannot resolve the VCS repository then every folder is removed",
+			hook:               true,
+			vcsErr:             true,
+			wantErrContains:    "mapping API unreachable",
+			wantRemoved:        []string{"actions/checkout/v4", "actions/setup-node/v4"},
+			wantRemovedWarning: []string{`"actions/checkout@v4"`, `"actions/setup-node@v4"`},
+		},
+		{
+			// No setup line names setup-node and its folder carries no watermark: discovery refuses the job.
+			name: "verify when the hook's discovery fails then every action folder is removed",
+			hook: true,
+			diag: map[string]string{
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("actions", "checkout", testShaV4) + savedLine("actions", "setup-node", testShaNode),
+			},
+			cacheDirs:          []string{"actions/checkout/v4"},
+			unmarked:           "actions/setup-node/v4",
+			wantErrContains:    "cannot account for every entry",
+			wantRemoved:        []string{"actions/checkout/v4", "actions/checkout/v4.completed", "actions/setup-node/v4"},
+			wantKept:           []string{"."},
+			wantRemovedWarning: []string{`"actions/checkout@v4"`},
+		},
+		{
+			// The Worker saved testShaV4 under newowner/tool, which no folder is paired with, while oldowner/tool/v1
+			// holds that same commit: the renamed repository's folder would stay runnable if only the unpaired
+			// commit were removed. The unpaired ref has no ref name, so it is rejected as "newowner/tool@".
+			name: "verify when the hook rejects an unpaired commit then the folder of the same commit under another name is removed",
+			hook: true,
+			diag: map[string]string{
+				"pages/a_1.log": setupLine("oldowner", "tool", "v1", testShaV4) + setupLine("actions", "checkout", "v4", testShaV3),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("newowner", "tool", testShaV4) +
+					savedLine("actions", "checkout", testShaV3),
+			},
+			cacheDirs:          []string{"oldowner/tool/v1", "actions/checkout/v4"},
+			rejected:           []string{"newowner/tool@"},
+			wantErrContains:    "newowner/tool",
+			wantRemoved:        []string{"oldowner/tool/v1", "oldowner/tool/v1.completed"},
+			wantKept:           []string{"actions/checkout/v4", "actions/checkout/v4.completed"},
+			wantRemovedWarning: []string{`"oldowner/tool@v1"`},
+		},
+		{
+			name:            "verify when a step rejects an action then its folder is kept",
+			rejected:        []string{"actions/checkout@v4"},
+			wantErrContains: "actions/checkout@v4",
+			wantKept:        []string{"actions/checkout/v4", "actions/setup-node/v4"},
+		},
+		{
+			name:            "verify when a step cannot resolve the VCS repository then its folders are kept",
+			vcsErr:          true,
+			wantErrContains: "mapping API unreachable",
+			wantKept:        []string{"actions/checkout/v4", "actions/setup-node/v4"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, "octo/repo", "", "")
+			t.Setenv(stepSummaryEnvVar, "")
+			var decider githubactions.ActionCurationDecider = &scriptedDecider{rejected: tt.rejected}
+			if tt.denied {
+				decider = &probeDecider{denied: []string{"*"}}
+			}
+			var cmd *CurationActionsCommand
+			if tt.hook {
+				var runnerDir, cacheDir string
+				if tt.diag != nil {
+					runnerDir, cacheDir = hookRunner(t, tt.diag, tt.cacheDirs)
+				} else {
+					runnerDir, cacheDir = trustedHookJob(t)
+				}
+				if tt.unmarked != "" {
+					folder := filepath.Join(cacheDir, filepath.FromSlash(tt.unmarked))
+					require.NoError(t, os.MkdirAll(folder, 0o755))
+					require.NoError(t, os.WriteFile(filepath.Join(folder, "action.yml"), []byte("runs: {}"), 0o644))
+				}
+				cmd = NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetRunnerDir(runnerDir).
+					SetCallerMode(githubactions.ModeHook, "").SetDecider(decider)
+			} else {
+				cmd = runnerSpec{cacheDirs: []string{"actions/checkout/v4", "actions/setup-node/v4"}}.newCommand(t, noWorkflowFile, "", decider)
+			}
+			if tt.vcsErr {
+				cmd.SetVcsRepoResolver(&fixedResolver{err: errors.New("mapping API unreachable")})
+			}
+
+			report, err := captureReport(t, cmd)
+
+			require.ErrorContains(t, err, tt.wantErrContains)
+			if tt.denied {
+				assert.ErrorIs(t, err, githubactions.ErrAccessDenied)
+			}
+			for _, p := range tt.wantRemoved {
+				assert.False(t, folderExists(t, filepath.Join(cmd.actionsCacheDir, filepath.FromSlash(p))), "%s must be removed", p)
+			}
+			for _, p := range tt.wantKept {
+				assert.True(t, folderExists(t, filepath.Join(cmd.actionsCacheDir, filepath.FromSlash(p))), "%s must be kept", p)
+			}
+			wantWarnings := 0
+			if len(tt.wantRemovedWarning) > 0 {
+				wantWarnings = 1
+			}
+			assert.Equal(t, wantWarnings, strings.Count(report, "Removed the runner's copy"), "one warning lists what was removed: %s", report)
+			for _, name := range tt.wantRemovedWarning {
+				assert.Contains(t, report, name)
+			}
+		})
+	}
+}
+
+func TestCurationActionsCommand_Run_FromPreWarnsWhenTheFailureMayBeSwallowed(t *testing.T) {
+	ourStep := func(continueOnError string) string {
+		return `, "timeline": {"id": "a"}, "steps": [` +
+			`{"reference": {"type": "repository", "repositoryType": "GitHub", "name": "jfrog/curate", "ref": "v1"}` + continueOnError + `}, ` +
+			`{"reference": {"type": "repository", "repositoryType": "GitHub", "name": "actions/checkout", "ref": "v4"}}]`
+	}
+	tests := []struct {
+		name        string
+		job         string
+		invisible   bool
+		wantWarning bool
+	}{
+		{name: "verify when our step continues on error then the warning says the removal is what stops the action",
+			job: ourStep(`, "continueOnError": {"bool": true}`), wantWarning: true},
+		{name: "verify when our step does not continue on error then there is no such warning", job: ourStep("")},
+		{name: "verify when the runner cannot be found then the warning is given", invisible: true, wantWarning: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pinRunnerEnv(t, testGithubRepo, "", "")
+			t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+			t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+			t.Setenv(stepSummaryEnvVar, "")
+			runnerDir, cacheDir := hookRunnerForJob(t, tt.job, map[string]string{
+				"pages/a_1.log": setupLine("jfrog", "curate", "v1", testShaSelf) + setupLine("actions", "checkout", "v4", testShaV4),
+				"Worker_20261005-050652-utc.log": workerStart + savedLine("jfrog", "curate", testShaSelf) +
+					savedLine("actions", "checkout", testShaV4),
+			}, []string{"jfrog/curate/v1", "actions/checkout/v4"})
+			cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{rejected: []string{"actions/checkout@v4"}}).
+				SetFromPre(true)
+			cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+			if tt.invisible {
+				cmd.runnerDirFinder = func() (string, error) { return "", githubactions.ErrRunnerNotVisible }
+			}
+
+			report, err := captureReport(t, cmd)
+
+			require.Error(t, err)
+			assert.False(t, folderExists(t, filepath.Join(cacheDir, "actions", "checkout", "v4")))
+			assert.True(t, folderExists(t, filepath.Join(cacheDir, "jfrog", "curate", "v1")))
+			assert.Equal(t, tt.wantWarning, strings.Contains(report, "may be swallowed"), "report: %s", report)
+		})
+	}
+}
+
+func TestCurationActionsCommand_Run_FromPreKeepsTheRepositoryFolderOfAnUndeterminedAction(t *testing.T) {
+	// The hosted e2e case: an Undetermined private action whose ref folder holds a sub-path action.
+	pinRunnerEnv(t, testGithubRepo, "", "")
+	t.Setenv(githubactions.ActionRepositoryEnvVar, "jfrog/curate")
+	t.Setenv(githubactions.RunnerEnvironmentEnvVar, "github-hosted")
+	t.Setenv(stepSummaryEnvVar, "")
+	t.Setenv(githubStateEnvVar, "")
+	const probe = "dattathallam/probe-runner-hook-sha"
+	runnerDir, cacheDir := hookRunnerForJob(t, jobFields("jfrog/curate", probe), map[string]string{
+		"pages/a_1.log": setupLine("jfrog", "curate", "v1", testShaSelf) + setupLine("dattathallam", "probe-runner-hook-sha", "e2e-v2", testShaV4),
+		"Worker_20261005-050652-utc.log": workerStart + savedLine("jfrog", "curate", testShaSelf) +
+			savedLine("dattathallam", "probe-runner-hook-sha", testShaV4),
+	}, []string{"jfrog/curate/v1", probe + "/e2e-v2"})
+	repoDir := filepath.Join(cacheDir, "dattathallam", "probe-runner-hook-sha")
+	require.NoError(t, os.MkdirAll(filepath.Join(repoDir, "e2e-v2", "e2e-victim"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "e2e-v2", "e2e-victim", "action.yml"), []byte("runs: {}"), 0o644))
+	cmd := NewCurationActionsCommand().SetActionsCacheDir(cacheDir).SetDecider(&scriptedDecider{undecidable: []string{probe + "@e2e-v2"}}).
+		SetFromPre(true)
+	cmd.runnerDirFinder = func() (string, error) { return runnerDir, nil }
+
+	report, err := captureReport(t, cmd)
+
+	require.Error(t, err)
+	assert.False(t, folderExists(t, filepath.Join(repoDir, "e2e-v2")))
+	assert.False(t, folderExists(t, filepath.Join(repoDir, "e2e-v2.completed")))
+	assert.True(t, folderExists(t, repoDir), "the repository folder itself stays")
+	assert.True(t, folderExists(t, filepath.Join(cacheDir, "jfrog", "curate", "v1")))
+	assert.Contains(t, report, `: "`+probe+`@e2e-v2"`+"\n", "the warning names only the removed ref folder: %s", report)
 }

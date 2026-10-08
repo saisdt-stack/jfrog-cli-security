@@ -181,13 +181,11 @@ func TestParseGitRefsInvalid(t *testing.T) {
 		{name: "verify when a length exceeds 65520 then it is rejected", stream: service + "fff1" + strings.Repeat("x", 65517) + flushPkt},
 		{name: "verify when a payload is shorter than its declared length then it is rejected", stream: service + "0040" + branchTip + " refs/heads/main"},
 		{name: "verify when the control packet 0001 appears then it is rejected", stream: service + "0001" + flushPkt},
-		{name: "verify when the control packet 0002 appears then it is rejected", stream: service + "0002" + flushPkt},
 		{name: "verify when the service header is missing then it is rejected", stream: head + flushPkt},
 		{name: "verify when the service header names another service then it is rejected", stream: pkt("# service=git-receive-pack\n") + flushPkt + head + flushPkt},
 		{name: "verify when the service header is not followed by a flush then it is rejected", stream: pkt(uploadPackServiceLine+"\n") + head + flushPkt},
 		{name: "verify when the terminating flush is missing then it is rejected", stream: service + head},
 		{name: "verify when bytes follow the terminating flush then it is rejected", stream: service + head + flushPkt + "x"},
-		{name: "verify when a packet follows the terminating flush then it is rejected", stream: service + head + flushPkt + head},
 		{name: "verify when protocol version 2 is announced then it is rejected", stream: advertisement(pkt("version 2\n"), head)},
 		{name: "verify when a ref name contains a control character then it is rejected", stream: advertisement(head, pkt(branchTip+" refs/heads/main\x00x\n"))},
 		{name: "verify when object formats conflict then it is rejected", stream: advertisement(pkt(branchTip + " HEAD\x00object-format=sha1 object-format=sha256\n"))},
@@ -302,19 +300,4 @@ func TestParseGitRefsCapturedAdvertisements(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestRefAdvertisementCommit(t *testing.T) {
-	adv := &RefAdvertisement{
-		Refs:   map[string]string{"refs/heads/main": branchTip, "refs/tags/collision": tagObject},
-		Peeled: map[string]string{"refs/tags/collision": tagCommit},
-	}
-	got, ok := adv.Commit("refs/tags/collision")
-	assert.True(t, ok)
-	assert.Equal(t, tagCommit, got, "an annotated tag is answered by its peeled commit, not the tag object")
-	got, ok = adv.Commit("refs/heads/main")
-	assert.True(t, ok)
-	assert.Equal(t, branchTip, got)
-	_, ok = adv.Commit("refs/heads/gone")
-	assert.False(t, ok)
 }

@@ -31,7 +31,7 @@ func buildCache(t *testing.T, entries []cacheEntry) []ActionRef {
 		if e.linkSHA != "" {
 			target := filepath.Join(cache, "actions_checkout", e.linkSHA, "checkout-"+e.linkSHA)
 			require.NoError(t, os.MkdirAll(target, 0o755))
-			require.NoError(t, os.Symlink(target, path))
+			symlinkOrSkip(t, target, path)
 		} else {
 			require.NoError(t, os.MkdirAll(path, 0o755))
 			require.NoError(t, os.WriteFile(path+watermarkSuffix, nil, 0o644))
@@ -53,7 +53,7 @@ func TestAttachRunnerProvenance(t *testing.T) {
 		setupJob     []LoggedAction
 		worker       []WorkerAction
 		wantSHAs     map[string]string // ref -> RunnerSHA; "" means left unknown
-		wantUnplaced int
+		wantUnplaced []WorkerAction    // every Worker action no ref took, in log order
 	}{
 		{
 			name:     "verify when the setup lines are present then they pair ref and SHA directly",
@@ -98,7 +98,7 @@ func TestAttachRunnerProvenance(t *testing.T) {
 			entries:      []cacheEntry{{ref: "v2", completed: t0}, {ref: "v3", completed: t0}},
 			worker:       []WorkerAction{dl(shaV3), dl(shaV2)},
 			wantSHAs:     map[string]string{"v3": "", "v2": ""},
-			wantUnplaced: 2,
+			wantUnplaced: []WorkerAction{dl(shaV3), dl(shaV2)},
 		},
 		{
 			name: "verify when SHAs and refs do not pair one to one then none is guessed",
@@ -106,7 +106,7 @@ func TestAttachRunnerProvenance(t *testing.T) {
 				{ref: "v4", completed: t0.Add(2 * time.Second)}},
 			worker:       []WorkerAction{dl(shaV3), dl(shaV2)},
 			wantSHAs:     map[string]string{"v2": "", "v3": "", "v4": ""},
-			wantUnplaced: 2,
+			wantUnplaced: []WorkerAction{dl(shaV3), dl(shaV2)},
 		},
 		{
 			// The runner wipes _actions at job start, so every folder came from a download this job
@@ -129,6 +129,22 @@ func TestAttachRunnerProvenance(t *testing.T) {
 			worker:   []WorkerAction{dl(shaV4)},
 			wantSHAs: map[string]string{shaV2: "", "v4": shaV4},
 		},
+		{
+			name:         "verify when the Worker log names an action the cache does not hold then it is unplaced",
+			entries:      []cacheEntry{{ref: "v4", completed: t0}},
+			worker:       []WorkerAction{dl(shaV4), {Owner: "actions", Repo: "setup-node", SHA: shaNode}},
+			wantSHAs:     map[string]string{"v4": shaV4},
+			wantUnplaced: []WorkerAction{{Owner: "actions", Repo: "setup-node", SHA: shaNode}},
+		},
+		{
+			// The runner names the _actions folder and the setup line as the workflow wrote the action, and
+			// the Worker log by the name GitHub resolved it to, which differs after a repository transfer.
+			name:     "verify when the repository was renamed then the setup line's SHA still pairs with the Worker entry",
+			entries:  []cacheEntry{{ref: "v4", completed: t0}},
+			setupJob: []LoggedAction{{Owner: "actions", Repo: "checkout", Ref: "v4", SHA: shaV4}},
+			worker:   []WorkerAction{{Owner: "newowner", Repo: "checkout", SHA: shaV4}},
+			wantSHAs: map[string]string{"v4": shaV4},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -139,30 +155,9 @@ func TestAttachRunnerProvenance(t *testing.T) {
 				got[r.Ref] = r.RunnerSHA
 			}
 			assert.Equal(t, tt.wantSHAs, got)
-			assert.Len(t, unplaced, tt.wantUnplaced)
+			assert.Equal(t, tt.wantUnplaced, unplaced, "AttachRunnerProvenance() unplaced")
 		})
 	}
-}
-
-func TestAttachRunnerProvenanceReportsActionsMissingFromTheCache(t *testing.T) {
-	refs := buildCache(t, []cacheEntry{{ref: "v4", completed: time.Now()}})
-	worker := []WorkerAction{
-		{Owner: "actions", Repo: "checkout", SHA: shaV4},
-		{Owner: "actions", Repo: "setup-node", SHA: shaNode},
-	}
-	_, unplaced := AttachRunnerProvenance(refs, nil, worker)
-	assert.Equal(t, []WorkerAction{worker[1]}, unplaced)
-}
-
-func TestAttachRunnerProvenanceMatchesARenamedRepositoryBySHA(t *testing.T) {
-	// The runner names the _actions folder and the setup line as the workflow wrote the action, and
-	// the Worker log by the name GitHub resolved it to, which differs after a repository transfer.
-	walked := []ActionRef{{Owner: "oldowner", Repo: "tool", Ref: "v1", Path: filepath.Join(t.TempDir(), "v1")}}
-	setupJob := []LoggedAction{{Owner: "oldowner", Repo: "tool", Ref: "v1", SHA: shaV4}}
-	worker := []WorkerAction{{Owner: "newowner", Repo: "tool", SHA: shaV4}}
-	refs, unplaced := AttachRunnerProvenance(walked, setupJob, worker)
-	assert.Equal(t, shaV4, refs[0].RunnerSHA)
-	assert.Empty(t, unplaced)
 }
 
 func TestRefsFromSetupJobKeepsRefsInsideTheActionCache(t *testing.T) {

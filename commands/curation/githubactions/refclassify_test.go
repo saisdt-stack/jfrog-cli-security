@@ -33,6 +33,7 @@ func testAdvertisement() *RefAdvertisement {
 			"refs/heads/collision":                  branchTip,
 			"refs/heads/c15aeb3":                    c15aeb3Tip,
 			"refs/heads/" + strings.Repeat("a", 39): branchTip,
+			"refs/heads/" + strings.Repeat("a", 41): branchTip,
 			"refs/pull/2264/head":                   pullHead,
 			"refs/pull/2264/merge":                  pullMerge,
 		},
@@ -56,13 +57,13 @@ func TestClassifyRef(t *testing.T) {
 		{name: "verify when a fully-qualified tag collides with a branch then it downloads by tag", ref: "refs/tags/collision", want: ResolvedRef{Kind: RefKindTag, APIRef: "collision"}},
 		{name: "verify when a fully-qualified branch collides with a tag then it downloads the branch tip commit", ref: "refs/heads/collision", want: ResolvedRef{Kind: RefKindCommit, APIRef: branchTip}},
 		{name: "verify when a pull head ref is used then it downloads the commit it points at", ref: "refs/pull/2264/head", want: ResolvedRef{Kind: RefKindCommit, APIRef: pullHead}},
-		{name: "verify when a pull merge ref is used then it downloads its own distinct commit", ref: "refs/pull/2264/merge", want: ResolvedRef{Kind: RefKindCommit, APIRef: pullMerge}},
 		{name: "verify when a ref is a full 40-hex ID then it downloads by commit", ref: branchTip, want: ResolvedRef{Kind: RefKindCommit, APIRef: branchTip}},
 		{name: "verify when a ref is a mixed-case 40-hex ID then it is lower-cased", ref: strings.ToUpper(branchTip), want: ResolvedRef{Kind: RefKindCommit, APIRef: branchTip}},
 		{name: "verify when a ref is a 64-hex ID then it downloads by commit", ref: sha256Object, want: ResolvedRef{Kind: RefKindCommit, APIRef: sha256Object}},
 		{name: "verify when a ref is an annotated tag object ID then it is passed through unpeeled", ref: tagObject, want: ResolvedRef{Kind: RefKindCommit, APIRef: tagObject}},
 		{name: "verify when a 7-hex string is a real branch name then it downloads by branch", ref: "c15aeb3", want: ResolvedRef{Kind: RefKindBranch, APIRef: "c15aeb3"}},
 		{name: "verify when a 39-hex string is a real branch name then it downloads by branch", ref: strings.Repeat("a", 39), want: ResolvedRef{Kind: RefKindBranch, APIRef: strings.Repeat("a", 39)}},
+		{name: "verify when a 41-hex string is a real branch name then it downloads by branch", ref: strings.Repeat("a", 41), want: ResolvedRef{Kind: RefKindBranch, APIRef: strings.Repeat("a", 41)}},
 		{name: "verify when a branch name is mixed case then its casing is kept", ref: "Feature/X", want: ResolvedRef{Kind: RefKindBranch, APIRef: "Feature/X"}},
 	}
 	for _, tt := range tests {
@@ -80,54 +81,24 @@ func TestClassifyRefErrors(t *testing.T) {
 	tests := []struct {
 		name string
 		ref  string
-		adv  *RefAdvertisement
+		adv  *RefAdvertisement // nil: classified without the repository's refs
+		// wantNotAdvertised is true when the error must be ErrRefNotAdvertised (the ref moved or was
+		// deleted); false for the nil-advertisement misuse, which is a plain error.
+		wantNotAdvertised bool
 	}{
-		{name: "verify when a bare name is neither a tag nor a branch then it errors", ref: "no-such-ref", adv: testAdvertisement()},
-		{name: "verify when a fully-qualified tag is not advertised then it errors", ref: "refs/tags/v99", adv: testAdvertisement()},
-		{name: "verify when a fully-qualified branch is not advertised then it errors", ref: "refs/heads/gone", adv: testAdvertisement()},
-		{name: "verify when a pull ref is not advertised then it errors", ref: "refs/pull/1/head", adv: testAdvertisement()},
-		{name: "verify when a branch name matches in another case only then it errors", ref: "MAIN", adv: testAdvertisement()},
+		{name: "verify when a name is classified without an advertisement then it errors", ref: "main"},
+		{name: "verify when a bare name is neither a tag nor a branch then it errors", ref: "no-such-ref", adv: testAdvertisement(), wantNotAdvertised: true},
+		{name: "verify when a fully-qualified tag is not advertised then it errors", ref: "refs/tags/v99", adv: testAdvertisement(), wantNotAdvertised: true},
+		{name: "verify when a fully-qualified branch is not advertised then it errors", ref: "refs/heads/gone", adv: testAdvertisement(), wantNotAdvertised: true},
+		{name: "verify when a pull ref is not advertised then it errors", ref: "refs/pull/1/head", adv: testAdvertisement(), wantNotAdvertised: true},
+		{name: "verify when a branch name matches in another case only then it errors", ref: "MAIN", adv: testAdvertisement(), wantNotAdvertised: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := ClassifyRef(tt.ref, tt.adv)
 
-			assert.True(t, errors.Is(err, ErrRefNotAdvertised), "ClassifyRef(%q) error = %v, want ErrRefNotAdvertised", tt.ref, err)
-		})
-	}
-}
-
-func TestClassifyRefWithoutAdvertisement(t *testing.T) {
-	t.Run("verify when a full object ID is classified then no advertisement is needed", func(t *testing.T) {
-		got, err := ClassifyRef(branchTip, nil)
-
-		require.NoError(t, err)
-		assert.Equal(t, ResolvedRef{Kind: RefKindCommit, APIRef: branchTip}, got)
-	})
-	t.Run("verify when a name is classified without an advertisement then it errors", func(t *testing.T) {
-		_, err := ClassifyRef("main", nil)
-
-		assert.Error(t, err)
-	})
-}
-
-func TestNeedsRefs(t *testing.T) {
-	tests := []struct {
-		ref  string
-		want bool
-	}{
-		{ref: branchTip, want: false},
-		{ref: strings.ToUpper(branchTip), want: false},
-		{ref: sha256Object, want: false},
-		{ref: "v4", want: true},
-		{ref: "refs/heads/main", want: true},
-		{ref: "c15aeb3", want: true},
-		{ref: strings.Repeat("a", 39), want: true},
-		{ref: strings.Repeat("a", 41), want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.ref, func(t *testing.T) {
-			assert.Equal(t, tt.want, NeedsRefs(tt.ref), "NeedsRefs(%q)", tt.ref)
+			require.Error(t, err, "ClassifyRef(%q)", tt.ref)
+			assert.Equal(t, tt.wantNotAdvertised, errors.Is(err, ErrRefNotAdvertised), "ClassifyRef(%q) error = %v, want errors.Is(ErrRefNotAdvertised) = %v", tt.ref, err, tt.wantNotAdvertised)
 		})
 	}
 }

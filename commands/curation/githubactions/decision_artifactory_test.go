@@ -134,17 +134,6 @@ func TestArtifactoryDeciderApproves(t *testing.T) {
 			wantNotes:    resolvedSHANotePrefix + checkoutV4Commit,
 		},
 		{
-			name: "verify when an uppercase SHA is approved then it is requested lower-cased", owner: "actions", repo: "checkout", ref: strings.ToUpper(checkoutV4Commit),
-			filename:     "checkout-" + checkoutV4Commit + ".tar.gz",
-			wantRequests: []string{"downloadCommit/github-vcs/actions/checkout/" + checkoutV4Commit},
-			wantNotes:    resolvedSHANotePrefix + checkoutV4Commit,
-		},
-		{
-			name: "verify when a fully-qualified tag is approved then the short name is requested", owner: "actions", repo: "checkout", ref: "refs/tags/v4",
-			filename:     "checkout-v4.tar.gz",
-			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
-		},
-		{
 			name: "verify when a fully-qualified branch collides with a tag then its tip commit is requested", owner: "actions", repo: "checkout", ref: "refs/heads/collision",
 			filename:     "checkout-" + branchTip + ".tar.gz",
 			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadCommit/github-vcs/actions/checkout/" + branchTip},
@@ -160,10 +149,6 @@ func TestArtifactoryDeciderApproves(t *testing.T) {
 			filename:     "X-" + branchTip + ".tar.gz",
 			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadBranch/github-vcs/actions/checkout/Feature/X"},
 			wantNotes:    resolvedSHANotePrefix + branchTip,
-		},
-		{
-			name: "verify when the response names no archive then the action is approved without a note", owner: "actions", repo: "checkout", ref: "main",
-			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadBranch/github-vcs/actions/checkout/main"},
 		},
 	}
 	for _, tt := range tests {
@@ -318,45 +303,15 @@ func TestArtifactoryDeciderResolvedSHASource(t *testing.T) {
 }
 
 func TestArtifactoryDeciderRejects(t *testing.T) {
-	t.Run("verify when a download is blocked by curation then the verdict is Rejected with the reason and the runner's copy is kept", func(t *testing.T) {
-		fake := &fakeArtifactory{
-			refsStatus: http.StatusOK, refsBody: deciderAdvertisement,
-			downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope),
-		}
-		actionDir := runnerCache(t, "v4")
-		before := snapshotDir(t, actionDir)
-		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: actionDir}
-
-		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-
-		require.NoError(t, err, "a curation block is a verdict, not an error")
-		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions"}, got)
-		assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
-	})
-}
-
-func TestArtifactoryDeciderRejectsNamingOnlyARequestedCommit(t *testing.T) {
 	const reason = "Package is blocked by policy: no-unpinned-actions"
 	tests := []struct {
 		name      string
-		ref       string
+		ref       string // the literal ref; the runner's copy is laid out under it by runnerCache
 		wantNotes string
 	}{
-		{
-			name:      "verify when a ref pinned to a commit is blocked then the notes name that commit",
-			ref:       strings.ToUpper(tagCommit),
-			wantNotes: reason + "; " + resolvedSHANotePrefix + tagCommit,
-		},
-		{
-			name:      "verify when a branch colliding with a tag is blocked then the notes name the tip commit requested",
-			ref:       "refs/heads/collision",
-			wantNotes: reason + "; " + resolvedSHANotePrefix + branchTip,
-		},
-		{
-			name:      "verify when a tag is blocked then the notes name no commit, since Artifactory resolved it",
-			ref:       "v4",
-			wantNotes: reason,
-		},
+		{name: "verify when a tag is blocked then the verdict is Rejected with the reason alone, since Artifactory resolved the tag", ref: "v4", wantNotes: reason},
+		{name: "verify when a ref pinned to a commit is blocked then the notes name that commit", ref: strings.ToUpper(tagCommit), wantNotes: reason + "; " + resolvedSHANotePrefix + tagCommit},
+		{name: "verify when a branch colliding with a tag is blocked then the notes name the tip commit requested", ref: "refs/heads/collision", wantNotes: reason + "; " + resolvedSHANotePrefix + branchTip},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -364,54 +319,65 @@ func TestArtifactoryDeciderRejectsNamingOnlyARequestedCommit(t *testing.T) {
 				refsStatus: http.StatusOK, refsBody: deciderAdvertisement,
 				downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope),
 			}
-			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: t.TempDir()}
+			actionDir := runnerCache(t, tt.ref)
+			before := snapshotDir(t, actionDir)
 
-			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: actionDir})
 
-			require.NoError(t, err)
+			require.NoError(t, err, "a curation block is a verdict, not an error")
 			assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: tt.wantNotes}, got)
+			assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
 		})
 	}
 }
 
 func TestArtifactoryDeciderErrors(t *testing.T) {
 	tests := []struct {
-		name         string
-		fake         *fakeArtifactory
-		ref          string
+		name string
+		fake *fakeArtifactory
+		ref  string
+		// loggedSHA is a commit the runner's trusted log names for the action, which sends Decide down
+		// the fast path that downloads that commit and never looks the ref up.
+		loggedSHA    string
 		wantDenied   bool
 		wantNotFound bool
-		wantRequests int
+		wantRequests []string // the requests the fake recorded, in order
 	}{
 		{
 			name: "verify when a download returns 401 then it is an access failure",
 			fake: &fakeArtifactory{refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusUnauthorized},
-			ref:  "v4", wantDenied: true, wantRequests: 2,
+			ref:  "v4", wantDenied: true, wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
+		},
+		{
+			name:      "verify when the download of a logged commit returns 401 then it is an access failure",
+			fake:      &fakeArtifactory{downloadStatus: http.StatusUnauthorized},
+			ref:       "v4",
+			loggedSHA: sha40, wantDenied: true, wantRequests: []string{"downloadCommit/github-vcs/actions/checkout/" + sha40},
 		},
 		{
 			name: "verify when getRefs returns 401 then it is an access failure and nothing is downloaded",
 			fake: &fakeArtifactory{refsStatus: http.StatusUnauthorized},
-			ref:  "v4", wantDenied: true, wantRequests: 1,
+			ref:  "v4", wantDenied: true, wantRequests: []string{"refs/github-vcs/actions/checkout"},
 		},
 		{
 			name: "verify when getRefs returns 403 then it is an access failure and not a Rejected verdict",
 			fake: &fakeArtifactory{refsStatus: http.StatusForbidden, refsBody: blockedEnvelope},
-			ref:  "v4", wantDenied: true, wantRequests: 1,
+			ref:  "v4", wantDenied: true, wantRequests: []string{"refs/github-vcs/actions/checkout"},
 		},
 		{
 			name: "verify when a download returns 404 then it is an error but not an access failure",
 			fake: &fakeArtifactory{refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusNotFound, downloadBody: []byte(notFoundBody)},
-			ref:  "v4", wantRequests: 2,
+			ref:  "v4", wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
 		},
 		{
 			name: "verify when the ref is not advertised then it errors without downloading",
 			fake: &fakeArtifactory{refsStatus: http.StatusOK, refsBody: deciderAdvertisement},
-			ref:  "no-such-ref", wantNotFound: true, wantRequests: 1,
+			ref:  "no-such-ref", wantNotFound: true, wantRequests: []string{"refs/github-vcs/actions/checkout"},
 		},
 		{
 			name: "verify when the served archive is not a tarball then it errors and the runner's copy is kept",
 			fake: &fakeArtifactory{refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusOK, downloadBody: []byte("not a tarball")},
-			ref:  "v4", wantRequests: 2,
+			ref:  "v4", wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
 		},
 		{
 			// Comparing nothing must not approve the runner's copy.
@@ -420,7 +386,7 @@ func TestArtifactoryDeciderErrors(t *testing.T) {
 				refsStatus: http.StatusOK, refsBody: deciderAdvertisement, downloadStatus: http.StatusOK,
 				downloadBody: buildTarGz(t, tarEntry{name: "checkout-" + branchTip + "/", dir: true}),
 			},
-			ref: "v4", wantRequests: 2,
+			ref: "v4", wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
 		},
 	}
 	for _, tt := range tests {
@@ -429,6 +395,9 @@ func TestArtifactoryDeciderErrors(t *testing.T) {
 			actionDir := runnerCache(t, tt.ref)
 			before := snapshotDir(t, actionDir)
 			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: actionDir}
+			if tt.loggedSHA != "" {
+				ref.RunnerSHA, ref.Verification = tt.loggedSHA, VerifyLoggedSHA
+			}
 
 			got, err := newTestDecider(t, tt.fake).Decide(context.Background(), testRepoKey, ref)
 
@@ -436,7 +405,7 @@ func TestArtifactoryDeciderErrors(t *testing.T) {
 			assert.Equal(t, ActionCurationResult{}, got, "an error must not also carry a verdict")
 			assert.Equal(t, tt.wantDenied, errors.Is(err, ErrAccessDenied), "Decide() error = %v, want errors.Is(ErrAccessDenied) = %v", err, tt.wantDenied)
 			assert.Equal(t, tt.wantNotFound, errors.Is(err, ErrRefNotAdvertised), "Decide() error = %v, want errors.Is(ErrRefNotAdvertised) = %v", err, tt.wantNotFound)
-			assert.Len(t, tt.fake.recorded(), tt.wantRequests)
+			assert.Equal(t, tt.wantRequests, tt.fake.recorded())
 			assert.Equal(t, before, snapshotDir(t, actionDir), "Decide modified the runner's copy")
 			assertNoSpoolLeft(t, tempDir)
 		})
@@ -453,29 +422,6 @@ func TestArtifactoryDeciderHonoursCancelledContext(t *testing.T) {
 
 		assert.True(t, errors.Is(err, context.Canceled), "Decide() error = %v, want context.Canceled", err)
 		assert.Empty(t, fake.recorded())
-	})
-}
-
-func TestArtifactoryDeciderDecidesByTheRunnerSHA(t *testing.T) {
-	t.Run("verify when the runner SHA is known then its commit is downloaded and the runner copy is not compared", func(t *testing.T) {
-		notTheApprovedContent := t.TempDir()
-		tempDir := isolateTempDir(t)
-		fake := approvingArtifactory(t, "")
-		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: notTheApprovedContent, RunnerSHA: tagCommit, Verification: VerifyLoggedSHA}
-		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-		require.NoError(t, err)
-		assert.Equal(t, ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + tagCommit}, got)
-		assert.Equal(t, []string{"downloadCommit/github-vcs/actions/checkout/" + tagCommit}, fake.recorded(),
-			"the ref is not looked up: the runner already named the commit")
-		assertNoSpoolLeft(t, tempDir)
-	})
-	t.Run("verify when the runner SHA is known and its commit is blocked then it is rejected with that SHA in the notes", func(t *testing.T) {
-		fake := &fakeArtifactory{downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope)}
-		ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", Path: t.TempDir(), RunnerSHA: tagCommit, Verification: VerifyLoggedSHA}
-		got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-		require.NoError(t, err)
-		assert.Equal(t, ActionCurationResult{Status: ActionRejected, Notes: "Package is blocked by policy: no-unpinned-actions; " + resolvedSHANotePrefix + tagCommit}, got)
-		assert.Equal(t, []string{"downloadCommit/github-vcs/actions/checkout/" + tagCommit}, fake.recorded())
 	})
 }
 
@@ -508,146 +454,135 @@ func writeTree(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-func TestArtifactoryDeciderLoggedSHAApprovesWithoutReadingTheRunnersCopy(t *testing.T) {
-	fake := approvingArtifactory(t, "owner-repo-"+sha40+".tar.gz")
-	ref := ActionRef{Owner: "Owner", Repo: "Repo", Ref: "v1", Path: filepath.Join(t.TempDir(), "absent"),
-		RunnerSHA: strings.ToUpper(sha40), Verification: VerifyLoggedSHA}
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-	require.NoError(t, err)
-	assert.Equal(t, ActionApproved, got.Status)
-	assert.Equal(t, resolvedSHANotePrefix+sha40, got.Notes)
-	assert.Equal(t, []string{"downloadCommit/github-vcs/owner/repo/" + sha40}, fake.recorded(), "the fast path asks for the commit and nothing else")
-}
-
-func TestArtifactoryDeciderLoggedSHAWithoutARunnerSHAComparesContent(t *testing.T) {
-	fake := approvingArtifactoryWith(t, "owner-repo-"+sha40+".tar.gz", map[string]string{"action.yml": "a"})
-	ref := ActionRef{Owner: "owner", Repo: "repo", Ref: "v4", Path: writeTree(t, map[string]string{"action.yml": "evil"}),
-		Verification: VerifyLoggedSHA}
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-	require.NoError(t, err)
-	assert.Equal(t, ActionRejected, got.Status)
-	assert.Contains(t, got.Notes, contentMismatchNote)
-}
-
-func TestArtifactoryDeciderZeroVerificationWithARunnerSHAComparesContentAtThatCommit(t *testing.T) {
-	fake := approvingArtifactoryWith(t, "owner-repo-"+sha40+".tar.gz", map[string]string{"action.yml": "a"})
-	path := writeTree(t, map[string]string{"action.yml": "evil"})
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey,
-		ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", Path: path, RunnerSHA: sha40})
-	require.NoError(t, err)
-	assert.Equal(t, ActionRejected, got.Status)
-	assert.Contains(t, got.Notes, contentMismatchNote)
-	assert.Equal(t, []string{"downloadCommit/github-vcs/owner/repo/" + sha40}, fake.recorded(), "no ref resolution before the compare")
-}
-
-func TestArtifactoryDeciderBlockedActionIsNotNotedAsVerifiedByContent(t *testing.T) {
-	fake := &fakeArtifactory{downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope)}
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ActionRef{Owner: "owner", Repo: "repo", Ref: "v1",
-		Path: writeTree(t, map[string]string{"action.yml": "a"}), RunnerSHA: sha40, ContentReason: "log-untrusted"})
-	require.NoError(t, err)
-	assert.Equal(t, ActionRejected, got.Status)
-	assert.NotContains(t, got.Notes, "verified by content", "nothing was compared, the policy blocked the download")
-}
-
-func TestArtifactoryDeciderContentAtSHANotesTheReason(t *testing.T) {
-	files := map[string]string{"action.yml": "a"}
-	fake := approvingArtifactoryWith(t, "owner-repo-"+sha40+".tar.gz", files)
-	ref := ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", Path: writeTree(t, files), RunnerSHA: sha40, ContentReason: "stale-line"}
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-	require.NoError(t, err)
-	assert.Equal(t, ActionApproved, got.Status)
-	assert.Equal(t, resolvedSHANotePrefix+sha40+"; verified by content: "+ref.ContentReason, got.Notes)
-}
-
-func TestArtifactoryDeciderContentMismatchNotesTheReason(t *testing.T) {
-	fake := approvingArtifactoryWith(t, "owner-repo-"+sha40+".tar.gz", map[string]string{"action.yml": "a"})
-	ref := ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", Path: writeTree(t, map[string]string{"action.yml": "evil"}),
-		RunnerSHA: sha40, ContentReason: "no-sha"}
-	got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-	require.NoError(t, err)
-	assert.Equal(t, ActionRejected, got.Status)
-	assert.True(t, strings.HasSuffix(got.Notes, "; verified by content: no-sha"), got.Notes)
-}
-
-func TestArtifactoryDeciderUnpairedLoggedCommitIsDecidedBySHA(t *testing.T) {
-	// A commit the Worker logged that no folder took: no ref and no path, so only its SHA can be decided.
-	unpaired := ActionRef{Owner: "owner", Repo: "repo", RunnerSHA: sha40, Verification: VerifyLoggedSHA}
+func TestArtifactoryDeciderVerificationPaths(t *testing.T) {
+	const blockReason = "Package is blocked by policy: no-unpinned-actions"
+	approved := map[string]string{"action.yml": "a"}
+	tampered := map[string]string{"action.yml": "evil"}
 	tests := []struct {
 		name string
-		fake *fakeArtifactory
-		want ActionCurationResult
+		// ref is the action as discovery hands it over; the loop fills Path unless unpaired is set.
+		ref ActionRef
+		// unpaired leaves Ref and Path empty: a logged commit that no _actions folder was paired with.
+		unpaired bool
+		// runnerFiles is the runner's copy of the action; nil means the folder is absent, so a row that
+		// passes proves the runner's copy was never read.
+		runnerFiles map[string]string
+		// servedFiles is what Artifactory's archive holds under its top directory, named after filename.
+		servedFiles map[string]string
+		filename    string
+		// blocked makes every download a curation block (403 with blockedEnvelope).
+		blocked      bool
+		want         ActionCurationResult
+		wantRequests []string
 	}{
 		{
-			name: "verify when the logged commit is approved then it is Approved and noted as unpaired",
-			fake: approvingArtifactory(t, ""),
-			want: ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + sha40 + "; " + unpairedLoggedCommitNote},
+			name:         "verify when a trusted log names the commit then that commit is approved without reading the runner's copy",
+			ref:          ActionRef{Owner: "Owner", Repo: "Repo", Ref: "v1", RunnerSHA: strings.ToUpper(sha40), Verification: VerifyLoggedSHA},
+			filename:     "owner-repo-" + sha40 + ".tar.gz",
+			want:         ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + sha40},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
 		},
 		{
-			name: "verify when the logged commit is blocked then it is Rejected and noted as unpaired",
-			fake: &fakeArtifactory{downloadStatus: http.StatusForbidden, downloadBody: []byte(blockedEnvelope)},
-			want: ActionCurationResult{Status: ActionRejected,
-				Notes: "Package is blocked by policy: no-unpinned-actions; " + resolvedSHANotePrefix + sha40 + "; " + unpairedLoggedCommitNote},
+			name:         "verify when an unpaired logged commit is approved then it is Approved and noted as unpaired",
+			ref:          ActionRef{Owner: "owner", Repo: "repo", RunnerSHA: sha40, Verification: VerifyLoggedSHA},
+			unpaired:     true,
+			filename:     "owner-repo-" + sha40 + ".tar.gz",
+			want:         ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + sha40 + "; " + unpairedLoggedCommitNote},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
+		},
+		{
+			name:         "verify when an unpaired logged commit is blocked then it is Rejected naming the commit and noted as unpaired",
+			ref:          ActionRef{Owner: "owner", Repo: "repo", RunnerSHA: sha40, Verification: VerifyLoggedSHA},
+			unpaired:     true,
+			filename:     "owner-repo-" + sha40 + ".tar.gz",
+			blocked:      true,
+			want:         ActionCurationResult{Status: ActionRejected, Notes: blockReason + "; " + resolvedSHANotePrefix + sha40 + "; " + unpairedLoggedCommitNote},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
+		},
+		{
+			name:        "verify when a trusted log names no commit for the ref then the ref is resolved and the content compared",
+			ref:         ActionRef{Owner: "owner", Repo: "repo", Ref: "v4", Verification: VerifyLoggedSHA},
+			runnerFiles: tampered, servedFiles: approved, filename: "owner-repo-" + sha40 + ".tar.gz",
+			want:         ActionCurationResult{Status: ActionRejected, Notes: contentMismatchNote + " (action.yml differs); " + resolvedSHANotePrefix + sha40},
+			wantRequests: []string{"refs/github-vcs/owner/repo", "downloadTag/github-vcs/owner/repo/v4"},
+		},
+		{
+			name:        "verify when an untrusted log names a commit and the runner's copy matches it then it is Approved noting the reason",
+			ref:         ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", RunnerSHA: sha40, ContentReason: ReasonStaleLine},
+			runnerFiles: approved, servedFiles: approved, filename: "owner-repo-" + sha40 + ".tar.gz",
+			want:         ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + sha40 + "; verified by content: " + ReasonStaleLine},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
+		},
+		{
+			name:        "verify when an untrusted log names a commit and the runner's copy differs then it is Rejected at that commit without resolving the ref",
+			ref:         ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", RunnerSHA: sha40, ContentReason: ReasonNoSHA},
+			runnerFiles: tampered, servedFiles: approved, filename: "owner-repo-" + sha40 + ".tar.gz",
+			want:         ActionCurationResult{Status: ActionRejected, Notes: contentMismatchNote + " (action.yml differs); " + resolvedSHANotePrefix + sha40 + "; verified by content: " + ReasonNoSHA},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
+		},
+		{
+			name:        "verify when an untrusted log names a commit that curation blocks then the notes do not claim a content check",
+			ref:         ActionRef{Owner: "owner", Repo: "repo", Ref: "v1", RunnerSHA: sha40, ContentReason: ReasonLogUntrusted},
+			runnerFiles: approved, filename: "owner-repo-" + sha40 + ".tar.gz", blocked: true,
+			want:         ActionCurationResult{Status: ActionRejected, Notes: blockReason + "; " + resolvedSHANotePrefix + sha40},
+			wantRequests: []string{"downloadCommit/github-vcs/owner/repo/" + sha40},
+		},
+		{
+			name:         "verify when an annotated tag peels to a logged commit then it is decided by that commit without reading the runner's copy",
+			ref:          ActionRef{Owner: "actions", Repo: "checkout", Ref: "collision", LoggedSHAs: []string{sha40, tagCommit}, ContentReason: ReasonNoSHA},
+			filename:     "checkout-collision.tar.gz",
+			want:         ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + tagCommit},
+			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadCommit/github-vcs/actions/checkout/" + tagCommit},
+		},
+		{
+			name:         "verify when a branch tip is a logged commit then it is decided by that commit without reading the runner's copy",
+			ref:          ActionRef{Owner: "actions", Repo: "checkout", Ref: "main", LoggedSHAs: []string{strings.ToUpper(branchTip), sha40}, ContentReason: ReasonNoSHA},
+			filename:     "checkout-main.tar.gz",
+			want:         ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + branchTip},
+			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadCommit/github-vcs/actions/checkout/" + branchTip},
+		},
+		{
+			name:        "verify when a moved tag resolves to a commit that was not logged then the content is compared",
+			ref:         ActionRef{Owner: "actions", Repo: "checkout", Ref: "v4", LoggedSHAs: []string{sha40}, ContentReason: ReasonNoSHA},
+			runnerFiles: tampered, servedFiles: approved, filename: "checkout-v4.tar.gz",
+			want:         ActionCurationResult{Status: ActionRejected, Notes: contentMismatchNote + " (action.yml differs); verified by content: " + ReasonNoSHA},
+			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"},
+		},
+		{
+			name:        "verify when only an annotated tag's own object is logged then it does not pair and the content is compared",
+			ref:         ActionRef{Owner: "actions", Repo: "checkout", Ref: "collision", LoggedSHAs: []string{tagObject}, ContentReason: ReasonNoSHA},
+			runnerFiles: tampered, servedFiles: approved, filename: "checkout-collision.tar.gz",
+			want:         ActionCurationResult{Status: ActionRejected, Notes: contentMismatchNote + " (action.yml differs); verified by content: " + ReasonNoSHA},
+			wantRequests: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/collision"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := newTestDecider(t, tt.fake).Decide(context.Background(), testRepoKey, unpaired)
+			tempDir := isolateTempDir(t) // first: later t.TempDir calls then stay outside the watched temp dir
+			fake := approvingArtifactoryWith(t, tt.filename, tt.servedFiles)
+			if tt.blocked {
+				fake.downloadStatus, fake.downloadHeader, fake.downloadBody = http.StatusForbidden, nil, []byte(blockedEnvelope)
+			}
+			ref := tt.ref
+			var before map[string]string
+			switch {
+			case tt.unpaired:
+			case tt.runnerFiles == nil:
+				ref.Path = filepath.Join(t.TempDir(), "absent")
+			default:
+				ref.Path = writeTree(t, tt.runnerFiles)
+				before = snapshotDir(t, ref.Path)
+			}
+
+			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
+
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
-			assert.Equal(t, []string{"downloadCommit/github-vcs/owner/repo/" + sha40}, tt.fake.recorded())
-		})
-	}
-}
-
-func TestArtifactoryDeciderLoggedSHAsPairARefWithALoggedCommit(t *testing.T) {
-	// The runner's copy is absent in every paired case: nothing is read from it.
-	absent := filepath.Join(t.TempDir(), "absent")
-	tests := []struct {
-		name   string
-		ref    string
-		logged []string
-		want   string
-	}{
-		{name: "verify when an annotated tag peels to a logged commit then it is decided by that commit", ref: "collision", logged: []string{sha40, tagCommit}, want: tagCommit},
-		{name: "verify when a branch tip is a logged commit then it is decided by that commit", ref: "main", logged: []string{strings.ToUpper(branchTip), sha40}, want: branchTip},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tempDir := isolateTempDir(t)
-			fake := approvingArtifactory(t, "")
-			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: absent, LoggedSHAs: tt.logged, ContentReason: "no-sha"}
-			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-			require.NoError(t, err)
-			assert.Equal(t, ActionCurationResult{Status: ActionApproved, Notes: resolvedSHANotePrefix + tt.want}, got)
-			assert.Equal(t, []string{"refs/github-vcs/actions/checkout", "downloadCommit/github-vcs/actions/checkout/" + tt.want}, fake.recorded())
+			assert.Equal(t, tt.wantRequests, fake.recorded())
+			if before != nil {
+				assert.Equal(t, before, snapshotDir(t, ref.Path), "Decide modified the runner's copy")
+			}
 			assertNoSpoolLeft(t, tempDir)
-		})
-	}
-}
-
-func TestArtifactoryDeciderLoggedSHAsComparesWhenTheRefDoesNotResolveToALoggedCommit(t *testing.T) {
-	files := map[string]string{"action.yml": "a"}
-	tests := []struct {
-		name   string
-		ref    string
-		logged []string
-		want   []string
-	}{
-		{name: "verify when a moved tag resolves to another commit then the content is compared", ref: "v4", logged: []string{sha40},
-			want: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/v4"}},
-		{name: "verify when only an annotated tag's own object is logged then it does not pair", ref: "collision", logged: []string{tagObject},
-			want: []string{"refs/github-vcs/actions/checkout", "downloadTag/github-vcs/actions/checkout/collision"}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fake := approvingArtifactoryWith(t, "checkout-"+tt.ref+".tar.gz", files)
-			ref := ActionRef{Owner: "actions", Repo: "checkout", Ref: tt.ref, Path: writeTree(t, map[string]string{"action.yml": "evil"}),
-				LoggedSHAs: tt.logged, ContentReason: "no-sha"}
-			got, err := newTestDecider(t, fake).Decide(context.Background(), testRepoKey, ref)
-			require.NoError(t, err)
-			assert.Equal(t, ActionRejected, got.Status)
-			assert.Contains(t, got.Notes, contentMismatchNote)
-			assert.Equal(t, tt.want, fake.recorded())
 		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,9 +20,9 @@ import (
 func writeSummaryDataFile(t *testing.T, content ScanCommandResultSummary) string {
 	t.Helper()
 	data, err := json.Marshal(content)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	filePath := filepath.Join(t.TempDir(), string(content.ResultType)+".json")
-	assert.NoError(t, os.WriteFile(filePath, data, 0600))
+	require.NoError(t, os.WriteFile(filePath, data, 0600))
 	return filePath
 }
 
@@ -32,78 +33,12 @@ func TestGenerateActionsCurationSectionMarkdown(t *testing.T) {
 	tests := []struct {
 		name string
 		data []formats.ResultsSummary
-		// wantEmpty covers the cases the append in GenerateMarkdownFromFiles depends on: they must
-		// return the empty string, not a newline and not an empty collapsible block.
+		// wantEmpty: the section must be "" (not a newline, not an empty block) - GenerateMarkdownFromFiles appends it.
 		wantEmpty       bool
 		wantContains    []string
 		wantNotContains []string
 	}{
 		{name: "verify when there is no data then nothing is rendered", data: nil, wantEmpty: true},
-		{
-			name: "verify when a local composite action was declared then the section carries the caveat naming it",
-			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
-				CuratedActions: &formats.CuratedActions{
-					Attributed:            true,
-					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
-					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-				},
-			}}}},
-			wantContains: []string{"Not covered", "./.github/actions/setup", "actions/checkout"},
-		},
-		{
-			// Where the conflation lived: the table drops its Parent column when ANY scan is
-			// unattributed, and the caveat once borrowed that same flag - discarding a local
-			// action one scan had definitely found. The two questions are separate, so the
-			// section must state both the known path and the incomplete knowledge.
-			name: "verify when one scan found a local action and another was not attributed then both are stated",
-			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{
-				{CuratedActions: &formats.CuratedActions{
-					Attributed:            true,
-					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
-					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-				}},
-				{CuratedActions: actions(false, formats.CuratedAction{Action: "actions/cache", Ref: "v4", Status: "Approved"})},
-			}}},
-			wantContains: []string{
-				"| Action | Ref | Status | Notes |", // the Parent column still drops, as before
-				"./.github/actions/setup",
-				"there may be others it could not see",
-			},
-		},
-		{
-			name: "verify when a scan was not attributed then the section carries the unconditional caveat",
-			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
-				CuratedActions: actions(false, formats.CuratedAction{Action: "actions/checkout", Ref: "v4", Status: "Approved"}),
-			}}}},
-			wantContains: []string{"Local composite actions (uses: ./...) are not curated"},
-		},
-		{
-			name: "verify when attribution succeeded and no local action was declared then no caveat is rendered",
-			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
-				CuratedActions: actions(true, formats.CuratedAction{Action: "actions/checkout", Ref: "v4", Status: "Approved"}),
-			}}}},
-			wantNotContains: []string{"Not covered"},
-		},
-		{
-			// Two jobs' summary files merged into one section. The table already drops the Parent
-			// column on mixed data; the caveat has to name every local action across them, since
-			// dropping one would understate the gap in exactly the case with most to state.
-			name: "verify when several scans declare local actions then every one is named",
-			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{
-				{CuratedActions: &formats.CuratedActions{
-					Attributed:            true,
-					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
-					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-				}},
-				{CuratedActions: &formats.CuratedActions{
-					Attributed:            true,
-					Actions:               []formats.CuratedAction{{Action: "actions/cache", Ref: "v4", Status: "Approved"}},
-					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}, {Path: "./.github/actions/teardown", DeclaredBy: "some-org/wrapper@v1"}},
-				}},
-			}}},
-			wantContains: []string{"./.github/actions/setup", "./.github/actions/teardown"},
-		},
-		{name: "verify when the result set is empty then nothing is rendered", data: []formats.ResultsSummary{}, wantEmpty: true},
 		{
 			name: "verify when only package-curation data is present then nothing is rendered",
 			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{
@@ -125,6 +60,7 @@ func TestGenerateActionsCurationSectionMarkdown(t *testing.T) {
 				"actions/checkout", "Approved",
 				"some-org/transitive-action", "github/codeql-action@v3", "Rejected", "policy failure",
 			},
+			wantNotContains: []string{"Not covered"},
 		},
 		{
 			name: "verify when no scan was attributed then the Parent column is omitted",
@@ -150,11 +86,82 @@ func TestGenerateActionsCurationSectionMarkdown(t *testing.T) {
 			wantContains:    []string{"| Action | Ref | Status | Notes |"},
 			wantNotContains: []string{"c/d@v2"},
 		},
+		{
+			// A markdown table ends only at a blank line, so a caveat on the very next line would
+			// render as one more table row; the blank line comes from this function.
+			name: "verify when a local composite action was declared then the section carries the caveat naming it after a blank line",
+			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
+				CuratedActions: &formats.CuratedActions{
+					Attributed:            true,
+					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
+					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
+				},
+			}}}},
+			wantContains: []string{"Not covered", "./.github/actions/setup", "actions/checkout", "|\n\nNot covered"},
+		},
+		{
+			name: "verify when a scan was not attributed then the section carries the unconditional caveat after a blank line",
+			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
+				CuratedActions: actions(false, formats.CuratedAction{Action: "actions/checkout", Ref: "v4", Status: "Approved"}),
+			}}}},
+			wantContains: []string{"Local composite actions (uses: ./...) are not curated", "|\n\nLocal composite actions"},
+		},
+		{
+			// Where the conflation lived: the table drops its Parent column when ANY scan is
+			// unattributed, and the caveat once borrowed that same flag - discarding a local
+			// action one scan had definitely found. The two questions are separate, so the
+			// section must state both the known path and the incomplete knowledge.
+			name: "verify when one scan found a local action and another was not attributed then both are stated",
+			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{
+				{CuratedActions: &formats.CuratedActions{
+					Attributed:            true,
+					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
+					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
+				}},
+				{CuratedActions: actions(false, formats.CuratedAction{Action: "actions/cache", Ref: "v4", Status: "Approved"})},
+			}}},
+			wantContains: []string{
+				"| Action | Ref | Status | Notes |", // the Parent column still drops, as before
+				"./.github/actions/setup",
+				"there may be others it could not see",
+			},
+		},
+		{
+			// Two jobs' summary files merged into one section. The table already drops the Parent
+			// column on mixed data; the caveat has to name every local action across them, since
+			// dropping one would understate the gap in exactly the case with most to state.
+			name: "verify when several scans declare local actions then every one is named",
+			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{
+				{CuratedActions: &formats.CuratedActions{
+					Attributed:            true,
+					Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
+					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
+				}},
+				{CuratedActions: &formats.CuratedActions{
+					Attributed:            true,
+					Actions:               []formats.CuratedAction{{Action: "actions/cache", Ref: "v4", Status: "Approved"}},
+					LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}, {Path: "./.github/actions/teardown", DeclaredBy: "some-org/wrapper@v1"}},
+				}},
+			}}},
+			wantContains: []string{"./.github/actions/setup", "./.github/actions/teardown"},
+		},
+		{
+			// Same contract as RenderReportTable's console output: the job summary is rendered by
+			// GitHub, so an unescaped "|" or newline reshapes the table a reviewer actually reads.
+			name: "verify when cells hold a pipe or a newline then the row keeps the header's cell count",
+			data: []formats.ResultsSummary{{Scans: []formats.ScanSummary{{
+				Target: ".github/workflows/ci.yml",
+				CuratedActions: actions(true,
+					formats.CuratedAction{Action: "some-org/some-action", Ref: "feature|v2", Parent: "org/wrap|per@v1", Status: "Rejected", Notes: "blocked:\nCVE-2024-0001"},
+				),
+			}}}},
+			wantContains: []string{`| some-org/some-action | feature\|v2 | org/wrap\|per@v1 | Rejected | blocked:<br>CVE-2024-0001 |`},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			markdown, err := GenerateActionsCurationSectionMarkdown(tt.data)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			if tt.wantEmpty {
 				assert.Equal(t, "", markdown)
@@ -170,150 +177,87 @@ func TestGenerateActionsCurationSectionMarkdown(t *testing.T) {
 	}
 }
 
-func TestNewCurationActionsSummary(t *testing.T) {
-	summary := NewCurationActionsSummary(formats.CuratedActions{Attributed: true, Actions: []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}})
-
-	assert.Equal(t, "curate_gh_actions", string(summary.ResultType))
-	if assert.Len(t, summary.Summary.Scans, 1) {
-		assert.Empty(t, summary.Summary.Scans[0].Target,
-			"Target names a scanned path; this command curates the runner's action cache, which no renderer shows")
-		assert.True(t, summary.Summary.Scans[0].HasCuratedActions())
-	}
-}
-
-func TestNewCurationActionsSummary_CarriesLocalCompositeActions(t *testing.T) {
-	// The caveat is rendered from the summary file, so what the command knew about local
-	// composite actions has to survive the round trip rather than stopping at the console.
-	summary := NewCurationActionsSummary(formats.CuratedActions{
-		Attributed:            true,
-		Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
-		LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-	})
-
-	require.Len(t, summary.Summary.Scans, 1)
-	assert.Equal(t, []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}}, summary.Summary.Scans[0].CuratedActions.LocalCompositeActions)
-}
-
-func TestSecurityJobSummary_GenerateMarkdownFromFiles_CombinesCurationAndActions(t *testing.T) {
-	curationFile := writeSummaryDataFile(t, NewCurationSummary(formats.ResultsSummary{Scans: []formats.ScanSummary{{
-		Target:          "npm-project",
-		CuratedPackages: &formats.CuratedPackages{PackageCount: 1},
-	}}}))
-	actionsFile := writeSummaryDataFile(t, NewCurationActionsSummary(formats.CuratedActions{Attributed: true, Actions: []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}}))
-
-	js := &SecurityJobSummary{}
-	markdown, err := js.GenerateMarkdownFromFiles([]string{curationFile, actionsFile})
-	assert.NoError(t, err)
-	assert.Contains(t, markdown, "Curation Audit")
-	assert.Contains(t, markdown, "GitHub Actions Curation")
-	assert.True(t, strings.Index(markdown, "Curation Audit") < strings.Index(markdown, "GitHub Actions Curation"))
-}
-
-func TestSecurityJobSummary_GenerateMarkdownFromFiles_CurationAuditOnlyIsUnchanged(t *testing.T) {
-	// curate-gh-actions shares the "security" command-summary manager with curation-audit and
-	// appends to the same markdown. A run where only curation-audit executed must therefore be
-	// byte-for-byte what it was before the actions section existed - no stray heading, no
-	// trailing newline, nothing.
-	curationOnly := writeSummaryDataFile(t, NewCurationSummary(formats.ResultsSummary{Scans: []formats.ScanSummary{{
-		Target:          "npm-project",
-		CuratedPackages: &formats.CuratedPackages{PackageCount: 3},
-	}}}))
-
-	js := &SecurityJobSummary{}
-	combined, err := js.GenerateMarkdownFromFiles([]string{curationOnly})
-	assert.NoError(t, err)
-
-	// The curation section rendered on its own, which is what the pipeline produced before.
-	curationData, _, err := loadContent([]string{curationOnly}, utils.Curation)
-	assert.NoError(t, err)
-	expected, err := GenerateSecuritySectionMarkdown(curationData)
-	assert.NoError(t, err)
-
-	assert.Equal(t, expected, combined, "a curation-audit-only run must gain nothing from the actions section")
-	assert.NotContains(t, combined, "GitHub Actions Curation")
-}
-
-func TestGenerateActionsCurationSectionMarkdown_CellsThatWouldReshapeTheTableAreEscaped(t *testing.T) {
-	// Same contract as RenderReportTable's console output: the job summary is rendered by
-	// GitHub, so an unescaped "|" or newline reshapes the table a reviewer actually reads.
-	data := []formats.ResultsSummary{
-		{Scans: []formats.ScanSummary{{
-			Target: ".github/workflows/ci.yml",
-			CuratedActions: &formats.CuratedActions{
-				Attributed: true,
-				Actions: []formats.CuratedAction{
-					{Action: "some-org/some-action", Ref: "feature|v2", Parent: "org/wrap|per@v1", Status: "Rejected", Notes: "blocked:\nCVE-2024-0001"},
-				},
-			},
-		}}},
-	}
-
-	markdown, err := GenerateActionsCurationSectionMarkdown(data)
-	assert.NoError(t, err)
-
-	assert.Contains(t, markdown, `feature\|v2`)
-	assert.Contains(t, markdown, `org/wrap\|per@v1`)
-	assert.Contains(t, markdown, "blocked:<br>CVE-2024-0001")
-	for _, line := range strings.Split(markdown, "\n") {
-		if !strings.HasPrefix(line, "| some-org/some-action") {
-			continue
-		}
-		assert.Equal(t, 6, strings.Count(line, "|")-strings.Count(line, `\|`),
-			"the data row must keep the header's cell count")
-	}
-}
-
-func TestGenerateActionsCurationSectionMarkdown_LocalActionSharedBySeveralScansIsNamedOnce(t *testing.T) {
-	// Merged job-summary files repeat the same local action when two jobs declare it. The caveat
-	// is prose, so a repeated path reads as two separate gaps rather than one seen twice.
-	data := []formats.ResultsSummary{{Scans: []formats.ScanSummary{
-		{CuratedActions: &formats.CuratedActions{
-			Attributed:            true,
-			Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
-			LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-		}},
-		{CuratedActions: &formats.CuratedActions{
-			Attributed:            true,
-			Actions:               []formats.CuratedAction{{Action: "actions/cache", Ref: "v4", Status: "Approved"}},
-			LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
-		}},
-	}}}
-
-	markdown, err := GenerateActionsCurationSectionMarkdown(data)
-
-	require.NoError(t, err)
-	assert.Equal(t, 1, strings.Count(markdown, "./.github/actions/setup"))
-}
-
-func TestGenerateActionsCurationSectionMarkdownEndsTheTableBeforeTheCaveat(t *testing.T) {
-	// A markdown table ends only at a blank line, so a caveat on the very next line would render as
-	// one more table row.
+func TestSecurityJobSummary_GenerateMarkdownFromFiles(t *testing.T) {
+	const curationHeading, actionsHeading = "Curation Audit", "GitHub Actions Curation"
+	approvedCheckout := []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}
 	tests := []struct {
-		name    string
-		curated formats.CuratedActions
-		caveat  string
+		name string
+		// packages is a curation-audit run's summary; nil when curation-audit did not run.
+		packages *formats.ResultsSummary
+		// actions is a curate-gh-actions run's report; nil when it did not run.
+		actions *formats.CuratedActions
+		// wantSections are the section headings in the order they must appear; a known heading
+		// ("Curation Audit", "GitHub Actions Curation") not listed must be absent.
+		wantSections []string
+		wantContains []string
 	}{
 		{
-			name:    "verify when no workflow file was available then the unconditional caveat follows a blank line",
-			curated: formats.CuratedActions{Actions: []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}}},
-			caveat:  "Local composite actions",
+			name:         "verify when both commands ran then the curation-audit section comes before the actions section",
+			packages:     &formats.ResultsSummary{Scans: []formats.ScanSummary{{Target: "npm-project", CuratedPackages: &formats.CuratedPackages{PackageCount: 1}}}},
+			actions:      &formats.CuratedActions{Attributed: true, Actions: approvedCheckout},
+			wantSections: []string{curationHeading, actionsHeading},
+			wantContains: []string{"actions/checkout"},
 		},
 		{
-			name: "verify when a local composite action was found then the caveat naming it follows a blank line",
-			curated: formats.CuratedActions{
+			// curate-gh-actions shares the "security" command-summary manager with curation-audit and
+			// appends to the same markdown. A run where only curation-audit executed must therefore be
+			// byte-for-byte what it was before the actions section existed - no stray heading, no
+			// trailing newline, nothing.
+			name:         "verify when only curation-audit ran then its section is exactly what it was without the actions section",
+			packages:     &formats.ResultsSummary{Scans: []formats.ScanSummary{{Target: "npm-project", CuratedPackages: &formats.CuratedPackages{PackageCount: 3}}}},
+			wantSections: []string{curationHeading},
+		},
+		{
+			// The caveat is rendered from the summary file, so what the command knew about local
+			// composite actions has to survive the round trip rather than stopping at the console.
+			name: "verify when the actions report declared a local composite action then the caveat survives the summary file",
+			actions: &formats.CuratedActions{
 				Attributed:            true,
-				Actions:               []formats.CuratedAction{{Action: "actions/checkout", Ref: "v4", Status: "Approved"}},
+				Actions:               approvedCheckout,
 				LocalCompositeActions: []formats.LocalCompositeAction{{Path: "./.github/actions/setup"}},
 			},
-			caveat: "Not covered",
+			wantSections: []string{actionsHeading},
+			wantContains: []string{"Not covered", "./.github/actions/setup"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			curated := tt.curated
-			markdown, err := GenerateActionsCurationSectionMarkdown([]formats.ResultsSummary{{Scans: []formats.ScanSummary{{CuratedActions: &curated}}}})
+			var files []string
+			var curationFile string
+			if tt.packages != nil {
+				curationFile = writeSummaryDataFile(t, NewCurationSummary(*tt.packages))
+				files = append(files, curationFile)
+			}
+			if tt.actions != nil {
+				files = append(files, writeSummaryDataFile(t, NewCurationActionsSummary(*tt.actions)))
+			}
+
+			js := &SecurityJobSummary{}
+			markdown, err := js.GenerateMarkdownFromFiles(files)
 			require.NoError(t, err)
-			assert.Contains(t, markdown, "|\n\n"+tt.caveat)
+
+			last := -1
+			for _, heading := range tt.wantSections {
+				at := strings.Index(markdown, heading)
+				assert.Greater(t, at, last, "heading %q must appear after the previous one", heading)
+				last = at
+			}
+			for _, heading := range []string{curationHeading, actionsHeading} {
+				if !slices.Contains(tt.wantSections, heading) {
+					assert.NotContains(t, markdown, heading)
+				}
+			}
+			for _, want := range tt.wantContains {
+				assert.Contains(t, markdown, want)
+			}
+			if tt.actions == nil {
+				// The curation section rendered on its own, which is what the pipeline produced before.
+				curationData, _, err := loadContent([]string{curationFile}, utils.Curation)
+				require.NoError(t, err)
+				expected, err := GenerateSecuritySectionMarkdown(curationData)
+				require.NoError(t, err)
+				assert.Equal(t, expected, markdown, "a curation-audit-only run must gain nothing from the actions section")
+			}
 		})
 	}
 }

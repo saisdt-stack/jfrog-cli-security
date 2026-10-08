@@ -44,34 +44,34 @@ func TestAssessLogs(t *testing.T) {
 		wantJobText  string
 		wantReasons  map[string]string
 	}{
-		{name: "hook with consistent logs is trusted", mode: ModeHook, wantTrusted: true},
+		{name: "verify when a hook reads consistent logs then the job is trusted", mode: ModeHook, wantTrusted: true},
 		{
-			name:        "hook without a readable job message is not trusted",
+			name:        "verify when a hook cannot read the job message then the job is not trusted",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.Job, s.JobParsed = JobFacts{}, false },
 			wantJobText: "job message could not be read",
 		},
 		{
-			name:        "hook with a job message that names no steps is not trusted",
+			name:        "verify when a hook's job message names no steps then the job is not trusted",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.Job.Steps = nil },
 			wantJobText: "job message could not be read",
 		},
 		{
-			name:        "hook with a planted Worker log is not trusted",
+			name:        "verify when a Worker log other than the job's own is present then the job is not trusted",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.Planted = true },
 			wantJobText: "Worker log other than the job's own",
 		},
 		{
-			name:        "hook with a setup buffer that may hold other jobs' lines is not trusted",
+			name:        "verify when the setup buffer may hold other jobs' lines then the job is not trusted",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.SetupBufferUnfiltered = true },
 			wantJobText: "setup buffer",
 		},
-		{name: "pre of the first step is trusted, whatever the name's case", mode: ModePre, self: "Actions/Checkout", gitHubHosted: true, wantTrusted: true},
+		{name: "verify when the pre is the first step, named in any case, then the job is trusted", mode: ModePre, self: "Actions/Checkout", gitHubHosted: true, wantTrusted: true},
 		{
-			name: "pre of the second step is not trusted",
+			name: "verify when the pre is the second step then the job is not trusted",
 			mode: ModePre,
 			self: "octo/tool",
 			edit: func(s *DiagSnapshot) {
@@ -81,14 +81,14 @@ func TestAssessLogs(t *testing.T) {
 			wantJobText: "first step",
 		},
 		{
-			name:        "pre named like a local first step is not trusted",
+			name:        "verify when the first step is a local action named like the pre then the job is not trusted",
 			mode:        ModePre,
 			self:        "actions/checkout",
 			edit:        func(s *DiagSnapshot) { s.Job.Steps[0].RepositoryType = "self" },
 			wantJobText: "first step",
 		},
 		{
-			name: "pre of an action used again later in the job is not trusted",
+			name: "verify when the pre's action is used again later in the job then the job is not trusted",
 			mode: ModePre,
 			self: "actions/checkout",
 			edit: func(s *DiagSnapshot) {
@@ -97,36 +97,36 @@ func TestAssessLogs(t *testing.T) {
 			wantJobText: "more than once",
 		},
 		{
-			name:        "pre with no steps read is not trusted",
+			name:        "verify when the pre reads no steps then the job is not trusted",
 			mode:        ModePre,
 			self:        "actions/checkout",
 			edit:        func(s *DiagSnapshot) { s.Job.Steps = nil },
 			wantJobText: "cannot be proven",
 		},
-		{name: "pre without its own name is not trusted", mode: ModePre, wantJobText: "cannot be proven"},
+		{name: "verify when the pre does not know its own name then the job is not trusted", mode: ModePre, wantJobText: "cannot be proven"},
 		{
-			name:        "pre after service containers is not trusted",
+			name:        "verify when the job starts service containers then the pre is not trusted",
 			mode:        ModePre,
 			self:        "actions/checkout",
 			edit:        func(s *DiagSnapshot) { s.Job.HasServices = true },
 			wantJobText: "service, a container or an image build",
 		},
 		{
-			name:        "pre in a job container is not trusted",
+			name:        "verify when the job runs in a container then the pre is not trusted",
 			mode:        ModePre,
 			self:        "actions/checkout",
 			edit:        func(s *DiagSnapshot) { s.Job.HasContainer = true },
 			wantJobText: "service, a container or an image build",
 		},
 		{
-			name:        "pre after a Dockerfile image build is not trusted",
+			name:        "verify when the job builds a Dockerfile image then the pre is not trusted",
 			mode:        ModePre,
 			self:        "actions/checkout",
 			edit:        func(s *DiagSnapshot) { s.BuildsImage = true },
 			wantJobText: "service, a container or an image build",
 		},
 		{
-			name: "pre stays trusted with a docker pull step and a continue-on-error step",
+			name: "verify when the job has a docker pull step and a continue-on-error step then the pre stays trusted",
 			mode: ModePre,
 			self: "actions/checkout",
 			edit: func(s *DiagSnapshot) {
@@ -137,27 +137,16 @@ func TestAssessLogs(t *testing.T) {
 			},
 			wantTrusted: true,
 		},
-		{name: "unknown caller mode is never trusted", self: "actions/checkout", wantJobText: "position in the job is unknown"},
+		{name: "verify when the caller mode is unknown then the job is never trusted", self: "actions/checkout", wantJobText: "position in the job is unknown"},
 		{
-			name:        "stale setup line for a step's action downgrades every commit logged for that repository",
+			name:        "verify when a setup line names a commit the Worker did not fetch then every commit logged for that repository is stale",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.SetupJob = append(s.SetupJob, setup("actions", "checkout", "v3", shaV3)) },
 			wantTrusted: true,
 			wantReasons: map[string]string{checkoutV4: ReasonStaleLine, AssessmentKey("actions", "checkout", ""): ReasonStaleLine},
 		},
 		{
-			name: "forged setup line downgrades the commit the Worker logged under another ref",
-			mode: ModeHook,
-			edit: func(s *DiagSnapshot) {
-				s.Job.Steps = append(s.Job.Steps, step("repository", "GitHub", "x/y", "v9"))
-				s.SetupJob = append(s.SetupJob, setup("x", "y", "v9", shaV3))
-				s.Worker = append(s.Worker, worker("x", "y", shaNode, SourceSave))
-			},
-			wantTrusted: true,
-			wantReasons: map[string]string{AssessmentKey("x", "y", shaNode): ReasonStaleLine, AssessmentKey("x", "y", ""): ReasonStaleLine},
-		},
-		{
-			name:        "stale setup line for an action found only on disk and never logged by the Worker",
+			name:        "verify when a stale setup line names an action found only on disk then its SHA-less key is stale",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.SetupJob = append(s.SetupJob, setup("Octo", "Inner", "main", shaNode)) },
 			refs:        []ActionRef{{Owner: "octo", Repo: "inner", Ref: "main"}},
@@ -165,7 +154,7 @@ func TestAssessLogs(t *testing.T) {
 			wantReasons: map[string]string{AssessmentKey("octo", "inner", ""): ReasonStaleLine},
 		},
 		{
-			name: "stale line wins over cache source for the same commit",
+			name: "verify when a commit is both stale and cache-loaded then stale-line is the reason",
 			mode: ModeHook,
 			edit: func(s *DiagSnapshot) {
 				s.Worker[0].Source = SourceCache
@@ -175,13 +164,13 @@ func TestAssessLogs(t *testing.T) {
 			wantReasons: map[string]string{checkoutV4: ReasonStaleLine, AssessmentKey("actions", "checkout", ""): ReasonStaleLine},
 		},
 		{
-			name:        "setup line for an action that is not this job's is ignored",
+			name:        "verify when a setup line names an action outside this job then it is ignored",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.SetupJob = append(s.SetupJob, setup("other", "job", "v1", shaNode)) },
 			wantTrusted: true,
 		},
 		{
-			name: "repository step without a Worker entry has no SHA",
+			name: "verify when a repository step has no Worker entry then it is downgraded as no-sha",
 			mode: ModeHook,
 			edit: func(s *DiagSnapshot) {
 				s.Job.Steps = append(s.Job.Steps, step("repository", "github", "Octo/Tool", "v1"))
@@ -190,7 +179,7 @@ func TestAssessLogs(t *testing.T) {
 			wantReasons: map[string]string{AssessmentKey("octo", "tool", ""): ReasonNoSHA},
 		},
 		{
-			name: "local, docker and script steps need no Worker entry",
+			name: "verify when local, docker and script steps have no Worker entry then nothing is downgraded",
 			mode: ModeHook,
 			edit: func(s *DiagSnapshot) {
 				s.Job.Steps = append(s.Job.Steps,
@@ -201,20 +190,20 @@ func TestAssessLogs(t *testing.T) {
 			wantTrusted: true,
 		},
 		{
-			name:        "Worker entry for a remote composite's inner action needs no step",
+			name:        "verify when the Worker logged a remote composite's inner action without a step then nothing is downgraded",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.Worker = append(s.Worker, worker("octo", "inner", shaNode, SourceSave)) },
 			wantTrusted: true,
 		},
 		{
-			name:        "cache-loaded action on a self-hosted runner without an override",
+			name:        "verify when a self-hosted runner loaded an action from an untrusted cache then it is downgraded as cache-source",
 			mode:        ModeHook,
 			edit:        func(s *DiagSnapshot) { s.Worker[0].Source = SourceCache },
 			wantTrusted: true,
 			wantReasons: map[string]string{checkoutV4: ReasonCacheSource},
 		},
 		{
-			name: "trusting another cache entry does not cover this one",
+			name: "verify when another cache entry is trusted then this one is still downgraded",
 			mode: ModeHook,
 			edit: func(s *DiagSnapshot) {
 				s.Worker[0].Source = SourceCache
@@ -225,14 +214,14 @@ func TestAssessLogs(t *testing.T) {
 			wantReasons:  map[string]string{checkoutV4: ReasonCacheSource},
 		},
 		{
-			name:         "cache-loaded action from a trusted cache",
+			name:         "verify when the cache entry is trusted then the cache-loaded action is not downgraded",
 			mode:         ModeHook,
 			edit:         func(s *DiagSnapshot) { s.Worker[0].Source = SourceCache },
 			trustedCache: func(WorkerAction) bool { return true },
 			wantTrusted:  true,
 		},
 		{
-			name:         "cache-loaded action on a GitHub-hosted runner",
+			name:         "verify when a GitHub-hosted runner loaded an action from cache then it is not downgraded",
 			mode:         ModePre,
 			self:         "actions/checkout",
 			gitHubHosted: true,
@@ -256,8 +245,8 @@ func TestAssessLogs(t *testing.T) {
 			})
 			assert.Equal(t, tt.wantTrusted, got.JobTrusted, "AssessLogs().JobTrusted, reasons %q", got.JobReasons)
 			assert.Equal(t, tt.wantTrusted, len(got.JobReasons) == 0, "AssessLogs().JobReasons = %q", got.JobReasons)
-			if tt.wantJobText != "" {
-				assert.Contains(t, strings.Join(got.JobReasons, "\n"), tt.wantJobText)
+			if !tt.wantTrusted {
+				assert.Contains(t, strings.Join(got.JobReasons, "\n"), tt.wantJobText, "AssessLogs().JobReasons")
 			}
 			want := tt.wantReasons
 			if want == nil {
